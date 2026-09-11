@@ -15,12 +15,12 @@ public sealed class EtchvException(int statusCode, string detail, string? reques
     public string? IdempotencyKey { get; } = idempotencyKey;
 }
 public sealed record RequestOptions(string? Filename = null, string? IdempotencyKey = null);
-public sealed record EmbedResult(byte[] Bytes, string WatermarkId, string? RequestId, string ContentType, string Filename);
+public sealed record EmbedResult(byte[] Bytes, string WatermarkId, string? RequestId, string ContentType, string Filename, string? AssetId = null, string? SourceAssetId = null);
 public sealed record DetectionUnit(int Index, bool Watermarked, double Confidence, string? WatermarkId);
 public sealed record DetectionResult(bool Watermarked, double Confidence, string? WatermarkId, string? RequestId, IReadOnlyList<DetectionUnit> Units);
 
 /// <summary>Server-side client. Disposing the client releases its HTTP connection pool.</summary>
-public sealed class EtchvClient : IDisposable
+public sealed partial class EtchvClient : IDisposable
 {
     public const int MaxFileSize = 20 * 1024 * 1024;
     private readonly HttpClient http;
@@ -75,7 +75,7 @@ public sealed class EtchvClient : IDisposable
         };
         return RequestAsync($"watermarks/{media}" + (data is null ? "/detect" : ""), file, data, options, durable, data is null && media == "videos", ct);
     }
-    private sealed record Reply(byte[] Bytes, string? RequestId, string? WatermarkId, string ContentType, string Disposition);
+    private sealed record Reply(byte[] Bytes, string? RequestId, string? WatermarkId, string ContentType, string Disposition, string? AssetId, string? SourceAssetId);
     private async Task<Reply> RequestAsync(string path, byte[]? file, string? data, RequestOptions options, bool durable, bool detectionJob, CancellationToken caller)
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(caller);
@@ -109,7 +109,7 @@ public sealed class EtchvClient : IDisposable
                         buffer.Write(chunk, 0, n);
                     }
                     var bytes = buffer.ToArray(); int status = (int)response.StatusCode;
-                    if (status == 200) return new(bytes, requestId, Header("X-Watermark-ID"), response.Content.Headers.ContentType?.MediaType ?? "", response.Content.Headers.ContentDisposition?.ToString() ?? "");
+                    if (status == 200) return new(bytes, requestId, Header("X-Watermark-ID"), response.Content.Headers.ContentType?.MediaType ?? "", response.Content.Headers.ContentDisposition?.ToString() ?? "", Header("X-Asset-ID"), Header("X-Source-Asset-ID"));
                     JsonElement detail = default;
                     try { using var document = JsonDocument.Parse(bytes); detail = document.RootElement.Clone(); } catch (JsonException) { }
                     if (durable && status == 202)
@@ -136,7 +136,7 @@ public sealed class EtchvClient : IDisposable
         string? ext = Extension(r.Bytes, r.ContentType);
         if (ext is null || !ValidId(r.WatermarkId)) throw new EtchvException(200, "Invalid embedding response", r.RequestId);
         var match = Regex.Match(r.Disposition, "filename=\"?([A-Za-z0-9._-]+)\"?(?:;|$)");
-        return new(r.Bytes, r.WatermarkId!, r.RequestId, r.ContentType, match.Success ? match.Groups[1].Value : $"watermarked.{ext}");
+        return new(r.Bytes, r.WatermarkId!, r.RequestId, r.ContentType, match.Success ? match.Groups[1].Value : $"watermarked.{ext}", r.AssetId, r.SourceAssetId);
     }
     private static DetectionUnit Unit(JsonElement v, int index)
     {
