@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>Etchv</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Official Etchv client for image, PDF and video watermarking.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/etchv-labs/csharp-sdk</RepositoryUrl>
+  </PropertyGroup>
+</Project>
