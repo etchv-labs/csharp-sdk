@@ -41,6 +41,23 @@ public sealed partial class EtchvClient : IDisposable
         http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = Timeout.InfiniteTimeSpan };
     }
     public void Dispose() => http.Dispose();
+    public Task<JsonElement> SubmitEmbedAsync(string media, byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, string? webhookId = null, CancellationToken cancellationToken = default) {
+        if (data is null || data.Count == 0) throw new ArgumentException("data must be a non-empty JSON object");
+        return SubmitAsync(media, file, JsonSerializer.Serialize(data), options, webhookId, cancellationToken);
+    }
+    public Task<JsonElement> SubmitDetectionAsync(string media, byte[] file, RequestOptions? options = null, string? webhookId = null, CancellationToken cancellationToken = default) => SubmitAsync(media, file, null, options, webhookId, cancellationToken);
+    private async Task<JsonElement> SubmitAsync(string media, byte[] file, string? data, RequestOptions? options, string? webhookId, CancellationToken ct) {
+        if (media is not ("images" or "documents" or "videos") || file is null || file.Length == 0 || file.Length > MaxFileSize) throw new ArgumentException("Invalid media or file size");
+        if (webhookId is not null && !Regex.IsMatch(webhookId, @"\Awh_[a-f0-9]{32}\z")) throw new ArgumentException("Invalid webhook ID");
+        options ??= new(); options = options with { IdempotencyKey = string.IsNullOrEmpty(options.IdempotencyKey) ? Guid.NewGuid().ToString() : options.IdempotencyKey };
+        var r = await RequestAsync($"watermarks/{media}" + (data is null ? "/detect" : "") + "/async" + (webhookId is null ? "" : "?webhook_id=" + webhookId), file, data, options, true, data is null, ct);
+        using var document = JsonDocument.Parse(r.Bytes); return document.RootElement.Clone();
+    }
+    public async Task<JsonElement> GetJobAsync(string requestId, bool detect = false, CancellationToken cancellationToken = default) {
+        if (!ValidJob(requestId)) throw new ArgumentException("Invalid request ID");
+        var r = await RequestAsync($"watermarks/{(detect ? "detection-jobs" : "jobs")}/{requestId}", null, null, new(), false, detect, cancellationToken);
+        using var document = JsonDocument.Parse(r.Bytes); return document.RootElement.Clone();
+    }
     public Task<EmbedResult> EmbedImageAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("images", file, data, options, cancellationToken);
     public Task<EmbedResult> EmbedDocumentAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("documents", file, data, options, cancellationToken);
     public Task<EmbedResult> EmbedVideoAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("videos", file, data, options, cancellationToken);
@@ -109,7 +126,7 @@ public sealed partial class EtchvClient : IDisposable
                         buffer.Write(chunk, 0, n);
                     }
                     var bytes = buffer.ToArray(); int status = (int)response.StatusCode;
-                    if (status == 200) return new(bytes, requestId, Header("X-Watermark-ID"), response.Content.Headers.ContentType?.MediaType ?? "", response.Content.Headers.ContentDisposition?.ToString() ?? "", Header("X-Asset-ID"), Header("X-Source-Asset-ID"));
+                    if (status == 200 || (status == 202 && path.Split('?')[0].EndsWith("/async", StringComparison.Ordinal))) return new(bytes, requestId, Header("X-Watermark-ID"), response.Content.Headers.ContentType?.MediaType ?? "", response.Content.Headers.ContentDisposition?.ToString() ?? "", Header("X-Asset-ID"), Header("X-Source-Asset-ID"));
                     JsonElement detail = default;
                     try { using var document = JsonDocument.Parse(bytes); detail = document.RootElement.Clone(); } catch (JsonException) { }
                     if (durable && status == 202)
