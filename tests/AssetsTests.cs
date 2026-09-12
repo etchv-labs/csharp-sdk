@@ -28,7 +28,9 @@ public sealed class AssetsTests
   try{
    using var c=new EtchvClient("test-key",baseUrl,TimeSpan.FromSeconds(2));
    Assert.Equal("next-page",(await c.ListAssetsAsync(new(Kind:"watermarked"))).NextCursor);
-   Assert.Equal("launch",(await c.GetAssetAsync(id)).Metadata!.Value.GetProperty("campaign").GetString());
+   var asset=await c.GetAssetAsync(id);
+   Assert.Equal("launch",asset.Metadata!.Value.GetProperty("campaign").GetString());
+   Assert.Null(asset.FileExpiresAt); Assert.Equal("s3",asset.StorageProvider);
    Assert.Equal(2,(await c.UpdateAssetAsync(id,1,new Dictionary<string,object?>{{"name","renamed"}})).Version);
    Assert.Equal("file",Encoding.UTF8.GetString(await c.DownloadAssetAsync(id)));await c.DeleteAssetAsync(id);await c.DeleteAssetsAsync([id]);
    Assert.Equal(409,(await Assert.ThrowsAsync<EtchvException>(()=>c.ListAssetsAsync(new(Cursor:"next-page")))).StatusCode);

@@ -5,7 +5,9 @@ namespace Etchv;
 
 public sealed record AssetRecord(string Id, string Name, string Kind, string MediaType, string Format, string ContentType,
     long SizeBytes, string Sha256, string? ParentAssetId, string RequestId, string? WatermarkId, string CreatedAt,
-    string UpdatedAt, string FileExpiresAt, bool FileAvailable, int Version, JsonElement? Metadata, string? DownloadUrl);
+    string UpdatedAt, string? FileExpiresAt, bool FileAvailable, int Version, JsonElement? Metadata, string? DownloadUrl,
+    string? StorageProvider = null, string? StorageStatus = null, string? StorageDestinationId = null, string? StorageDeliveryId = null,
+    string? StagingExpiresAt = null, string? StagingDeletedAt = null);
 public sealed record AssetPage(IReadOnlyList<AssetRecord> Items, string? NextCursor);
 public sealed record AssetListOptions(int Limit = 25, string? Cursor = null, string? Kind = null, string? MediaType = null, string? WatermarkId = null);
 public sealed partial class EtchvClient
