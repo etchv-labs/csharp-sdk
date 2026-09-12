@@ -13,6 +13,10 @@ public sealed class AsyncTests {
         var server = Task.Run(async () => {
             for (int i = 0; i < 6; i++) {
                 var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromSeconds(5));
+                if (!context.Request.Url!.AbsolutePath.Contains("/detect/")) {
+                    Assert.Equal("dst_" + new string('c',32), context.Request.QueryString["storage_destination_id"]);
+                    Assert.Equal("a b/#file.pdf", context.Request.QueryString["storage_key"]);
+                }
                 Assert.Equal("POST", context.Request.HttpMethod);
                 Assert.EndsWith("/async", context.Request.Url!.AbsolutePath);
                 Assert.Equal(webhook, context.Request.QueryString["webhook_id"]);
@@ -26,7 +30,7 @@ public sealed class AsyncTests {
         using var client = new EtchvClient("test-key", url, TimeSpan.FromSeconds(2));
         foreach (var media in new[] { "images", "documents", "videos" }) {
             var opts = new RequestOptions(IdempotencyKey: "stable_test_key");
-            var embed = await client.SubmitEmbedAsync(media, [1,2,3], new Dictionary<string, object?> { ["asset"] = "test" }, opts, webhook);
+            var embed = await client.SubmitEmbedAsync(media, [1,2,3], new Dictionary<string, object?> { ["asset"] = "test" }, opts with { StorageDestinationId = "dst_" + new string('c',32), StorageKey = "a b/#file.pdf" }, webhook);
             Assert.Equal("queued", embed.GetProperty("status").GetString());
             var detect = await client.SubmitDetectionAsync(media, [1,2,3], opts, webhook);
             Assert.Equal("queued", detect.GetProperty("status").GetString());

@@ -14,8 +14,8 @@ public sealed class EtchvException(int statusCode, string detail, string? reques
     public string? RequestId { get; } = requestId;
     public string? IdempotencyKey { get; } = idempotencyKey;
 }
-public sealed record RequestOptions(string? Filename = null, string? IdempotencyKey = null);
-public sealed record EmbedResult(byte[] Bytes, string WatermarkId, string? RequestId, string ContentType, string Filename, string? AssetId = null, string? SourceAssetId = null);
+public sealed record RequestOptions(string? Filename = null, string? IdempotencyKey = null, string? StorageDestinationId = null, string? StorageKey = null);
+public sealed record EmbedResult(byte[] Bytes, string WatermarkId, string? RequestId, string ContentType, string Filename, string? AssetId = null, string? SourceAssetId = null, string? StorageDeliveryId = null);
 public sealed record DetectionUnit(int Index, bool Watermarked, double Confidence, string? WatermarkId);
 public sealed record DetectionResult(bool Watermarked, double Confidence, string? WatermarkId, string? RequestId, IReadOnlyList<DetectionUnit> Units);
 
@@ -58,6 +58,11 @@ public sealed partial class EtchvClient : IDisposable
         var r = await RequestAsync($"watermarks/{(detect ? "detection-jobs" : "jobs")}/{requestId}", null, null, new(), false, detect, cancellationToken);
         using var document = JsonDocument.Parse(r.Bytes); return document.RootElement.Clone();
     }
+    public async Task<JsonElement> GetStorageDeliveryAsync(string id, CancellationToken cancellationToken = default) {
+        if (!Regex.IsMatch(id, @"\Astd_[a-f0-9]{64}\z")) throw new ArgumentException("Invalid storage delivery ID");
+        using var doc = JsonDocument.Parse(await AssetRequestAsync("storage/deliveries/" + id, HttpMethod.Get, null, cancellationToken));
+        return doc.RootElement.Clone();
+    }
     public Task<EmbedResult> EmbedImageAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("images", file, data, options, cancellationToken);
     public Task<EmbedResult> EmbedDocumentAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("documents", file, data, options, cancellationToken);
     public Task<EmbedResult> EmbedVideoAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("videos", file, data, options, cancellationToken);
@@ -92,9 +97,15 @@ public sealed partial class EtchvClient : IDisposable
         };
         return RequestAsync($"watermarks/{media}" + (data is null ? "/detect" : ""), file, data, options, durable, data is null && media == "videos", ct);
     }
-    private sealed record Reply(byte[] Bytes, string? RequestId, string? WatermarkId, string ContentType, string Disposition, string? AssetId, string? SourceAssetId);
+    private sealed record Reply(byte[] Bytes, string? RequestId, string? WatermarkId, string ContentType, string Disposition, string? AssetId, string? SourceAssetId, string? StorageDeliveryId);
     private async Task<Reply> RequestAsync(string path, byte[]? file, string? data, RequestOptions options, bool durable, bool detectionJob, CancellationToken caller)
     {
+        if (options.StorageKey is not null && options.StorageDestinationId is null) throw new ArgumentException("Storage key requires destination");
+        if (options.StorageDestinationId is not null) {
+            if (data is null || !Regex.IsMatch(options.StorageDestinationId, @"\Adst_[a-f0-9]{32}\z")) throw new ArgumentException("Invalid storage destination or detection request");
+            path += (path.Contains('?') ? "&" : "?") + "storage_destination_id=" + Uri.EscapeDataString(options.StorageDestinationId);
+            if (options.StorageKey is not null) path += "&storage_key=" + Uri.EscapeDataString(options.StorageKey);
+        }
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(caller);
         deadline.CancelAfter(timeout); var ct = deadline.Token; string? requestId = null;
         try
@@ -126,7 +137,7 @@ public sealed partial class EtchvClient : IDisposable
                         buffer.Write(chunk, 0, n);
                     }
                     var bytes = buffer.ToArray(); int status = (int)response.StatusCode;
-                    if (status == 200 || (status == 202 && path.Split('?')[0].EndsWith("/async", StringComparison.Ordinal))) return new(bytes, requestId, Header("X-Watermark-ID"), response.Content.Headers.ContentType?.MediaType ?? "", response.Content.Headers.ContentDisposition?.ToString() ?? "", Header("X-Asset-ID"), Header("X-Source-Asset-ID"));
+                    if (status == 200 || (status == 202 && path.Split('?')[0].EndsWith("/async", StringComparison.Ordinal))) return new(bytes, requestId, Header("X-Watermark-ID"), response.Content.Headers.ContentType?.MediaType ?? "", response.Content.Headers.ContentDisposition?.ToString() ?? "", Header("X-Asset-ID"), Header("X-Source-Asset-ID"), Header("X-Storage-Delivery-ID"));
                     JsonElement detail = default;
                     try { using var document = JsonDocument.Parse(bytes); detail = document.RootElement.Clone(); } catch (JsonException) { }
                     if (durable && status == 202)
@@ -153,7 +164,7 @@ public sealed partial class EtchvClient : IDisposable
         string? ext = Extension(r.Bytes, r.ContentType);
         if (ext is null || !ValidId(r.WatermarkId)) throw new EtchvException(200, "Invalid embedding response", r.RequestId);
         var match = Regex.Match(r.Disposition, "filename=\"?([A-Za-z0-9._-]+)\"?(?:;|$)");
-        return new(r.Bytes, r.WatermarkId!, r.RequestId, r.ContentType, match.Success ? match.Groups[1].Value : $"watermarked.{ext}", r.AssetId, r.SourceAssetId);
+        return new(r.Bytes, r.WatermarkId!, r.RequestId, r.ContentType, match.Success ? match.Groups[1].Value : $"watermarked.{ext}", r.AssetId, r.SourceAssetId, r.StorageDeliveryId);
     }
     private static DetectionUnit Unit(JsonElement v, int index)
     {

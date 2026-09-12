@@ -6,9 +6,9 @@ Official server-side client for image, PDF and video watermarking. .NET 10. MIT 
 
 Build from source (not yet published on NuGet):
 ```sh
-git clone --branch v0.3.0 https://github.com/etchv-labs/csharp-sdk.git
+git clone --branch v0.4.0 https://github.com/etchv-labs/csharp-sdk.git
 dotnet pack csharp-sdk/src/Etchv -c Release -o ./packages
-dotnet add YourApp.csproj package Etchv --version 0.3.0 --source ./packages
+dotnet add YourApp.csproj package Etchv --version 0.4.0 --source ./packages
 ```
 
 ## Example
@@ -137,3 +137,27 @@ var status = await client.GetJobAsync(job.GetProperty("request_id").GetString()!
 Use the corresponding submission method for detection without forensic data. For detection status, set the status method’s `detect` argument to true. Existing embed/detect methods continue waiting for results.
 
 Create an endpoint in the [Etchv dashboard](https://etchv.com/dashboard/webhooks), then pass its ID when submitting. Persist your idempotency key before the upload so a lost receipt can be recovered safely. Download from the authenticated result URL after success, or use the existing result method. See the [async guide](https://etchv.com/docs/api/async) and [webhook verification guide](https://etchv.com/docs/api/webhooks).
+
+## Customer-owned storage
+
+Version 0.4.0 adds storage destination and object-key options to image,
+PDF and video embedding, including asynchronous submission. Configure and verify
+a destination first in the dashboard.
+
+```csharp
+var job = await client.SubmitEmbedAsync("documents", pdfBytes,
+    new Dictionary<string, object?> { ["recipient"] = "customer-123" },
+    new RequestOptions(Filename: "report.pdf", IdempotencyKey: "report-export-001",
+        StorageDestinationId: destinationId, StorageKey: "reports/watermarked.pdf"));
+// After the watermark job reports succeeded:
+var delivery = await client.GetStorageDeliveryAsync(job.GetProperty("storage_delivery_id").GetString()!);
+```
+
+The upload is queued after watermark verification, so its delivery record can
+initially return 404 while the watermark job is still processing. Wait for the
+watermark job to succeed before polling storage. Poll until `status` is `stored`,
+or handle a terminal failure. Upload retries do not watermark again or charge
+another credit. Binary embedding results include a storage delivery ID too.
+
+Use `storage:read` to inspect deliveries. Storage options do not apply to detection.
+See the [storage setup, retention and retry guide](https://etchv.com/docs/storage).
