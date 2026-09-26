@@ -5,8 +5,12 @@ Server-side .NET client for [Etchv](https://etchv.com): embed and detect invisib
 ## Install
 
 ```sh
-dotnet add package Etchv
+# From your project folder: clone next to it, not inside it
+git clone --branch v1.0.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
+dotnet add reference ../etchv-csharp-sdk/src/Etchv/Etchv.csproj
 ```
+
+The SDK is not published on NuGet; install it from the tagged GitHub release as shown. Don't install NuGet packages that claim to be the Etchv SDK.
 
 Requires .NET 10. `EtchvClient` is thread-safe; create one and dispose it on shutdown.
 
