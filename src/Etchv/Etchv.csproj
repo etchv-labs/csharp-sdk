@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Etchv</RootNamespace>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <WarningsAsErrors>$(WarningsAsErrors);CS1591;nullable</WarningsAsErrors>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+
+    <PackageId>Etchv</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Etchv Labs</Authors>
+    <Company>Etchv Labs</Company>
+    <Product>Etchv</Product>
+    <Copyright>Copyright (c) Etchv Labs</Copyright>
+    <Description>Official Etchv .NET client for invisible forensic watermarking and detection of images, PDFs and videos, with asset library, webhook and customer storage management.</Description>
+    <PackageTags>etchv;watermark;watermarking;forensic;detection;image;pdf;video;api;sdk</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://etchv.com/docs</PackageProjectUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/etchv-labs/csharp-sdk</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+  <!-- Embed SourceLink and commit metadata only in this repository's CI builds; other builds
+       must not embed remotes, commits or local paths. -->
+  <PropertyGroup Condition="'$(GITHUB_REPOSITORY)' != 'etchv-labs/csharp-sdk'">
+    <EnableSourceLink>false</EnableSourceLink>
+    <EnableSourceControlManagerQueries>false</EnableSourceControlManagerQueries>
+    <PathMap>$(MSBuildProjectDirectory)=/_/src/Etchv</PathMap>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+</Project>

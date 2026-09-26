@@ -1,0 +1,8 @@
+target/
+bin/
+obj/
+artifacts/
+__pycache__/
+.env*
+*.nupkg
+*.snupkg
