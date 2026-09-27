@@ -121,8 +121,10 @@ public sealed partial class EtchvClient : IDisposable
     public const string Version = "1.0.0";
     /// <summary>User-Agent sent with every request.</summary>
     public const string UserAgent = "etchv-csharp/" + Version;
-    /// <summary>Maximum upload and response size (20 MB).</summary>
-    public const int MaxFileSize = 20 * 1024 * 1024;
+    /// <summary>Maximum upload size (50 MB). The API rejects PDFs and videos over 20 MB with status 413.</summary>
+    public const int MaxFileSize = 50 * 1024 * 1024;
+    /// <summary>Maximum response or result file size (256 MB).</summary>
+    public const int MaxDownloadSize = 256 * 1024 * 1024;
     private const int MaxDetail = 10000;
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull };
     private readonly HttpClient http;
@@ -169,7 +171,7 @@ public sealed partial class EtchvClient : IDisposable
 
     /// <summary>Submits a background embedding job and returns its receipt without waiting (<c>POST /watermarks/{media}/async</c>).</summary>
     /// <param name="media"><c>images</c>, <c>documents</c> or <c>videos</c>.</param>
-    /// <param name="file">File bytes (1 byte to 20 MB).</param>
+    /// <param name="file">File bytes (1 byte to 50 MB; PDFs and videos up to 20 MB).</param>
     /// <param name="data">Non-empty JSON object of forensic data; its SHA-256 digest is embedded.</param>
     /// <param name="options">Filename, idempotency key and optional storage destination.</param>
     /// <param name="webhookId">Optional enabled webhook endpoint (<c>wh_…</c>) to notify on completion.</param>
@@ -183,7 +185,7 @@ public sealed partial class EtchvClient : IDisposable
 
     /// <summary>Submits a background detection job and returns its receipt without waiting (<c>POST /watermarks/{media}/detect/async</c>).</summary>
     /// <param name="media"><c>images</c>, <c>documents</c> or <c>videos</c>.</param>
-    /// <param name="file">File bytes (1 byte to 20 MB).</param>
+    /// <param name="file">File bytes (1 byte to 50 MB; PDFs and videos up to 20 MB).</param>
     /// <param name="options">Filename and idempotency key. Storage options do not apply to detection.</param>
     /// <param name="webhookId">Optional enabled webhook endpoint (<c>wh_…</c>) to notify on completion.</param>
     /// <param name="cancellationToken">Cancels the request; server work continues.</param>
@@ -212,32 +214,42 @@ public sealed partial class EtchvClient : IDisposable
     }
 
     /// <summary>Watermarks an image and waits for the verified result, polling if processing continues.</summary>
-    /// <param name="file">Image bytes (1 byte to 20 MB).</param>
+    /// <param name="file">Image bytes (1 byte to 50 MB).</param>
     /// <param name="data">Non-empty JSON object of forensic data.</param>
     /// <param name="options">Filename, idempotency key and optional storage destination.</param>
     /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedImageAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("images", file, data, options, cancellationToken);
     /// <summary>Watermarks a PDF and waits for the verified result, polling if processing continues.</summary>
-    /// <inheritdoc cref="EmbedImageAsync" path="/param"/>
+    /// <param name="file">PDF bytes (1 byte to 20 MB).</param>
+    /// <param name="data">Non-empty JSON object of forensic data.</param>
+    /// <param name="options">Filename, idempotency key and optional storage destination.</param>
+    /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedDocumentAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("documents", file, data, options, cancellationToken);
     /// <summary>Watermarks a video and waits for the verified result, polling if processing continues.</summary>
-    /// <inheritdoc cref="EmbedImageAsync" path="/param"/>
+    /// <param name="file">MP4 or MOV bytes (1 byte to 20 MB).</param>
+    /// <param name="data">Non-empty JSON object of forensic data.</param>
+    /// <param name="options">Filename, idempotency key and optional storage destination.</param>
+    /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedVideoAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("videos", file, data, options, cancellationToken);
     /// <summary>Detects a watermark in an image synchronously.</summary>
-    /// <param name="file">File bytes (1 byte to 20 MB).</param>
+    /// <param name="file">Image bytes (1 byte to 50 MB).</param>
     /// <param name="options">Filename and optional idempotency key.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectImageAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("images", file, options, cancellationToken);
     /// <summary>Detects watermarks in a PDF synchronously, page by page.</summary>
-    /// <inheritdoc cref="DetectImageAsync" path="/param"/>
+    /// <param name="file">PDF bytes (1 byte to 20 MB).</param>
+    /// <param name="options">Filename and optional idempotency key.</param>
+    /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectDocumentAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("documents", file, options, cancellationToken);
     /// <summary>Detects watermarks in a video, frame by frame, waiting for the durable job to finish.</summary>
-    /// <inheritdoc cref="DetectImageAsync" path="/param"/>
+    /// <param name="file">MP4 or MOV bytes (1 byte to 20 MB).</param>
+    /// <param name="options">Filename and optional idempotency key.</param>
+    /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectVideoAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("videos", file, options, cancellationToken);
 
@@ -279,7 +291,7 @@ public sealed partial class EtchvClient : IDisposable
 
     private static RequestOptions Prepare(string media, byte[] file, RequestOptions? options, bool durable)
     {
-        if (file is null || file.Length == 0 || file.Length > MaxFileSize) throw new ArgumentException("file must contain 1 byte to 20 MB", nameof(file));
+        if (file is null || file.Length == 0 || file.Length > MaxFileSize) throw new ArgumentException("file must contain 1 byte to 50 MB", nameof(file));
         options ??= new();
         return options with
         {
@@ -290,7 +302,7 @@ public sealed partial class EtchvClient : IDisposable
 
     private sealed record Reply(byte[] Bytes, int Status, string? RequestId, string? WatermarkId, string ContentType, string Disposition, string? AssetId, string? SourceAssetId, string? StorageDeliveryId, string? RetryAfter);
 
-    /// <summary>Sends one request, reading at most 20 MB. Never follows redirects.</summary>
+    /// <summary>Sends one request, reading at most 256 MB. Never follows redirects.</summary>
     private async Task<Reply> SendAsync(HttpMethod method, string path, HttpContent? content, string? idempotencyKey, CancellationToken ct)
     {
         var target = new Uri(baseUrl + "/" + path);
@@ -303,13 +315,13 @@ public sealed partial class EtchvClient : IDisposable
         string? requestId = Header("X-Request-ID");
         if (response.RequestMessage?.RequestUri is { } final && final != target)
             throw new EtchvException((int)response.StatusCode, "Redirects are not followed; configure the HttpClient with AllowAutoRedirect = false", requestId, idempotencyKey);
-        if (response.Content.Headers.ContentLength > MaxFileSize) throw new EtchvException((int)response.StatusCode, "Response exceeds 20 MB", requestId, idempotencyKey);
+        if (response.Content.Headers.ContentLength > MaxDownloadSize) throw new EtchvException((int)response.StatusCode, "Response exceeds 256 MB", requestId, idempotencyKey);
         using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var buffer = new MemoryStream();
         var chunk = new byte[81920]; int n;
         while ((n = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)
         {
-            if (buffer.Length + n > MaxFileSize) throw new EtchvException((int)response.StatusCode, "Response exceeds 20 MB", requestId, idempotencyKey);
+            if (buffer.Length + n > MaxDownloadSize) throw new EtchvException((int)response.StatusCode, "Response exceeds 256 MB", requestId, idempotencyKey);
             buffer.Write(chunk, 0, n);
         }
         return new(buffer.ToArray(), (int)response.StatusCode, requestId, Header("X-Watermark-ID"), response.Content.Headers.ContentType?.MediaType ?? "",

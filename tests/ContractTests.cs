@@ -65,6 +65,8 @@ public sealed class ContractTests
             using var cancel = new CancellationTokenSource(); cancel.Cancel();
             rejected = false; try { await c.EmbedImageAsync([1], data, cancellationToken: cancel.Token); } catch (OperationCanceledException) { rejected = true; }
             Check(rejected);
+            rejected = false; try { await c.EmbedImageAsync(new byte[EtchvClient.MaxFileSize + 1], data); } catch (ArgumentException) { rejected = true; }
+            Check(rejected);
         }
         server.Verify();
     }
