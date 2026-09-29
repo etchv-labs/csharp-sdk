@@ -47,6 +47,26 @@ if (status.Status == "succeeded")
 Resending the same request with the same `IdempotencyKey` returns the existing job without another charge.
 Detection uses `SubmitDetectionAsync`, `GetJobAsync(id, detect: true)` and `GetDetectionResultAsync`.
 
+## GPU processing
+
+Business and Enterprise plans can request GPU processing for any embed, detect or job submission. Other plans get HTTP 403.
+
+```csharp
+var result = await client.EmbedVideoAsync(videoBytes, data,
+    new RequestOptions(Filename: "clip.mp4", Accelerator: Accelerator.Gpu));
+Console.WriteLine(result.Accelerator); // Gpu, or Cpu if no GPU was ready
+```
+
+GPU operations cost 3× credits. When no GPU is ready, the file is processed on CPU at normal credits.
+`EmbedResult.Accelerator` and `DetectionResult.Accelerator` report the hardware actually used; job receipts
+include `AcceleratorRequested` and `Accelerator`. Omit the option for CPU (the default).
+
+## Retries
+
+Durable operations (embedding, video detection, job results) retry network errors and HTTP 429, 502, 503 and 504
+with the same idempotency key, waiting for `Retry-After` (up to 5 seconds per wait) when the API sends it, until the
+client timeout.
+
 ## Also included
 
 - API key check: `GetApiKeyInfoAsync`
@@ -59,7 +79,10 @@ Detection uses `SubmitDetectionAsync`, `GetJobAsync(id, detect: true)` and `GetD
 ## Errors
 
 API and transport failures throw `EtchvException` with `StatusCode` (`0` when no HTTP response), `RequestId`,
-`IdempotencyKey`, `Detail`, `ErrorCode` and `ErrorStatus`. Include the request ID when contacting support.
+`IdempotencyKey`, `Detail`, `ErrorCode` and `ErrorStatus`. `Code`, `DetailMessage` and `Limit` carry the API's
+`detail` (for example `rate_limited` or `concurrency_limited` and the limit on HTTP 429), and `RetryAfter` the requested
+wait. A structured `detail.message` is appended to the exception message. Include the request ID when contacting
+support.
 
 ```csharp
 catch (EtchvException e)

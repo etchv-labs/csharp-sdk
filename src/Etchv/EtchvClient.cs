@@ -1,13 +1,16 @@
 using System.Globalization;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
 namespace Etchv;
 
 /// <summary>
-/// An Etchv API error. <see cref="Exception.Message"/> never contains the API key, request bodies,
-/// or server-provided text; inspect <see cref="Detail"/> for the (truncated) response body.
+/// An Etchv API error. <see cref="Exception.Message"/> never contains the API key or request bodies; the only
+/// server-provided text it includes is a structured <c>detail.message</c>. Inspect <see cref="Detail"/> for the
+/// (truncated) response body.
 /// </summary>
 public sealed class EtchvException : Exception
 {
@@ -18,7 +21,7 @@ public sealed class EtchvException : Exception
     /// <param name="idempotencyKey">The idempotency key sent with the request, when any.</param>
     /// <param name="innerException">The underlying transport exception, when any.</param>
     public EtchvException(int statusCode, string detail, string? requestId = null, string? idempotencyKey = null, Exception? innerException = null)
-        : base(statusCode == 0 ? "Etchv request failed (client or transport error)" : $"Etchv request failed (HTTP {statusCode})", innerException)
+        : base(Describe(statusCode, detail), innerException)
     {
         StatusCode = statusCode; Detail = detail; RequestId = requestId; IdempotencyKey = idempotencyKey;
     }
@@ -34,14 +37,66 @@ public sealed class EtchvException : Exception
     public string? ErrorCode => Field("error_code");
     /// <summary>The <c>status</c> from a JSON error body (for example <c>expired</c> or <c>deleted</c> on HTTP 410), when present.</summary>
     public string? ErrorStatus => Field("status");
-    private string? Field(string name)
+    /// <summary>
+    /// The machine-readable <c>detail.code</c> from a JSON error body, when present (for example <c>rate_limited</c> or
+    /// <c>concurrency_limited</c> on HTTP 429).
+    /// </summary>
+    public string? Code => Field("detail", "code");
+    /// <summary>
+    /// The API's human-readable error message: <c>detail.message</c>, or <c>detail</c> when it is a string. A structured
+    /// <c>detail.message</c> is also appended to <see cref="Exception.Message"/>.
+    /// </summary>
+    public string? DetailMessage => Field("detail", "message") ?? Field("detail");
+    /// <summary>The numeric <c>detail.limit</c> from a JSON error body, when present (for example the rate or concurrency limit on HTTP 429).</summary>
+    public int? Limit => Element(Detail, "detail", "limit") is { ValueKind: JsonValueKind.Number } value && value.TryGetInt32(out var limit) ? limit : null;
+    /// <summary>How long the API asked the client to wait (<c>Retry-After</c>), when it sent one, for example on HTTP 429.</summary>
+    public TimeSpan? RetryAfter { get; init; }
+    private string? Field(string name, string? nested = null) =>
+        (nested is null ? Element(Detail, name) : Element(Detail, name, nested)) is { ValueKind: JsonValueKind.String } value ? value.GetString() : null;
+    private static JsonElement? Element(string json, params string[] path)
     {
         try
         {
-            using var doc = JsonDocument.Parse(Detail);
-            return doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+            using var doc = JsonDocument.Parse(json);
+            var value = doc.RootElement;
+            foreach (var key in path)
+                if (value.ValueKind != JsonValueKind.Object || !value.TryGetProperty(key, out value)) return null;
+            return value.Clone();
         }
         catch (JsonException) { return null; }
+    }
+    private static string Describe(int statusCode, string detail)
+    {
+        if (statusCode == 0) return "Etchv request failed (client or transport error)";
+        var message = $"Etchv request failed (HTTP {statusCode})";
+        return Element(detail, "detail", "message") is { ValueKind: JsonValueKind.String } api && api.GetString() is { Length: > 0 } text
+            ? $"{message}: {text}" : message;
+    }
+}
+
+/// <summary>Processing hardware for embedding and detection, sent as the <c>accelerator</c> query parameter.</summary>
+public enum Accelerator
+{
+    /// <summary>CPU processing (the API default).</summary>
+    Cpu,
+    /// <summary>
+    /// GPU processing. Requires the Business plan or higher (HTTP 403 otherwise) and costs 3× credits. When no GPU
+    /// is ready, the job runs on CPU at normal credits; the result's <c>Accelerator</c> reports what was used.
+    /// </summary>
+    Gpu,
+}
+
+/// <summary>Reads <c>"cpu"</c> or <c>"gpu"</c>; any other value becomes null rather than failing the response.</summary>
+internal sealed class AcceleratorJsonConverter : JsonConverter<Accelerator?>
+{
+    public override Accelerator? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType != JsonTokenType.String) { reader.Skip(); return null; }
+        return EtchvClient.ParseAccelerator(reader.GetString());
+    }
+    public override void Write(Utf8JsonWriter writer, Accelerator? value, JsonSerializerOptions options)
+    {
+        if (value is null) writer.WriteNullValue(); else writer.WriteStringValue(EtchvClient.Wire(value.Value));
     }
 }
 
@@ -50,7 +105,11 @@ public sealed class EtchvException : Exception
 /// <param name="IdempotencyKey">Stable key for durable operations. Generated when omitted; persist your own to recover across restarts.</param>
 /// <param name="StorageDestinationId">Verified customer storage destination (<c>dst_…</c>) for the watermarked result. Embedding only.</param>
 /// <param name="StorageKey">Relative object key beneath the destination prefix. Requires <paramref name="StorageDestinationId"/>.</param>
-public sealed record RequestOptions(string? Filename = null, string? IdempotencyKey = null, string? StorageDestinationId = null, string? StorageKey = null);
+/// <param name="Accelerator">
+/// Processing hardware; omitted by default (CPU). <see cref="Etchv.Accelerator.Gpu"/> requires the Business plan or higher
+/// (HTTP 403 otherwise) and costs 3× credits. When no GPU is ready, the job runs on CPU at normal credits.
+/// </param>
+public sealed record RequestOptions(string? Filename = null, string? IdempotencyKey = null, string? StorageDestinationId = null, string? StorageKey = null, Accelerator? Accelerator = null);
 
 /// <summary>A verified watermarked file.</summary>
 /// <param name="Bytes">Watermarked file bytes in the original format.</param>
@@ -61,7 +120,8 @@ public sealed record RequestOptions(string? Filename = null, string? Idempotency
 /// <param name="AssetId">Asset ID of the watermarked output, when saved.</param>
 /// <param name="SourceAssetId">Asset ID of the original upload, when saved.</param>
 /// <param name="StorageDeliveryId">Customer storage delivery ID, when a destination was selected.</param>
-public sealed record EmbedResult(byte[] Bytes, string WatermarkId, string? RequestId, string ContentType, string Filename, string? AssetId = null, string? SourceAssetId = null, string? StorageDeliveryId = null);
+/// <param name="Accelerator">Hardware that actually processed the file (<c>X-Etchv-Accelerator</c>), or null when not reported.</param>
+public sealed record EmbedResult(byte[] Bytes, string WatermarkId, string? RequestId, string ContentType, string Filename, string? AssetId = null, string? SourceAssetId = null, string? StorageDeliveryId = null, Accelerator? Accelerator = null);
 
 /// <summary>Detection result for one frame, page or composite.</summary>
 /// <param name="Index">Zero-based unit index.</param>
@@ -76,7 +136,8 @@ public sealed record DetectionUnit(int Index, bool Watermarked, double Confidenc
 /// <param name="WatermarkId">Watermark ID shared by all units, or null.</param>
 /// <param name="RequestId">The Etchv request ID.</param>
 /// <param name="Units">Per-frame, per-page or per-composite results.</param>
-public sealed record DetectionResult(bool Watermarked, double Confidence, string? WatermarkId, string? RequestId, IReadOnlyList<DetectionUnit> Units);
+/// <param name="Accelerator">Hardware that actually processed the file, or null when not reported.</param>
+public sealed record DetectionResult(bool Watermarked, double Confidence, string? WatermarkId, string? RequestId, IReadOnlyList<DetectionUnit> Units, Accelerator? Accelerator = null);
 
 /// <summary>A durable watermarking or detection job receipt.</summary>
 /// <param name="RequestId">Job ID (<c>req_…</c>).</param>
@@ -96,9 +157,12 @@ public sealed record DetectionResult(bool Watermarked, double Confidence, string
 /// <param name="StorageProvider"><c>etchv</c>, or the selected customer storage provider.</param>
 /// <param name="StorageDeliveryId">Customer storage delivery ID, if a destination was selected.</param>
 /// <param name="StorageDestinationId">Customer storage destination ID, if selected.</param>
+/// <param name="AcceleratorRequested">Hardware requested at submission, when reported.</param>
+/// <param name="Accelerator">Hardware that processed the job (<see cref="Etchv.Accelerator.Cpu"/> after an automatic GPU fallback), or null until known.</param>
 public sealed record JobReceipt(string RequestId, string Status, string Operation, string StatusUrl, string ResultUrl,
     string? WebhookId, string? AssetId, string? SourceAssetId, string Format, int FrameCount, int Credits, int Attempts,
-    string? ErrorCode, string? ResultExpiresAt, string StorageProvider = "etchv", string? StorageDeliveryId = null, string? StorageDestinationId = null)
+    string? ErrorCode, string? ResultExpiresAt, string StorageProvider = "etchv", string? StorageDeliveryId = null, string? StorageDestinationId = null,
+    Accelerator? AcceleratorRequested = null, Accelerator? Accelerator = null)
 {
     /// <summary>True when the job has <c>succeeded</c> or <c>failed</c>.</summary>
     public bool IsTerminal => Status is "succeeded" or "failed";
@@ -126,7 +190,7 @@ public sealed partial class EtchvClient : IDisposable
     /// <summary>Maximum response or result file size (256 MB).</summary>
     public const int MaxDownloadSize = 256 * 1024 * 1024;
     private const int MaxDetail = 10000;
-    private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull };
+    private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull, Converters = { new AcceleratorJsonConverter() } };
     private readonly HttpClient http;
     private readonly bool ownsHttp;
     private readonly string key;
@@ -136,6 +200,18 @@ public sealed partial class EtchvClient : IDisposable
     private static bool ValidJob(string? id) => id is not null && Regex.IsMatch(id, "\\Areq_[0-9a-f]{64}\\z");
     private static string Check(string? id, string pattern, string name) =>
         id is not null && Regex.IsMatch(id, "\\A" + pattern + "\\z") ? id : throw new ArgumentException("Invalid " + name);
+    internal static string Wire(Accelerator accelerator) => accelerator switch
+    {
+        Accelerator.Cpu => "cpu",
+        Accelerator.Gpu => "gpu",
+        _ => throw new ArgumentException("Accelerator must be Cpu or Gpu")
+    };
+    internal static Accelerator? ParseAccelerator(string? value) => value?.Trim().ToLowerInvariant() switch
+    {
+        "cpu" => Accelerator.Cpu,
+        "gpu" => Accelerator.Gpu,
+        _ => null
+    };
 
     /// <summary>Creates a client.</summary>
     /// <param name="apiKey">Server-side API key. Never embed it in client applications.</param>
@@ -173,7 +249,7 @@ public sealed partial class EtchvClient : IDisposable
     /// <param name="media"><c>images</c>, <c>documents</c> or <c>videos</c>.</param>
     /// <param name="file">File bytes (1 byte to 50 MB; PDFs and videos up to 20 MB).</param>
     /// <param name="data">Non-empty JSON object of forensic data; its SHA-256 digest is embedded.</param>
-    /// <param name="options">Filename, idempotency key and optional storage destination.</param>
+    /// <param name="options">Filename, idempotency key, optional storage destination and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="webhookId">Optional enabled webhook endpoint (<c>wh_…</c>) to notify on completion.</param>
     /// <param name="cancellationToken">Cancels the request; server work continues.</param>
     /// <returns>The job receipt. Replays with the same idempotency key return the existing job.</returns>
@@ -186,7 +262,7 @@ public sealed partial class EtchvClient : IDisposable
     /// <summary>Submits a background detection job and returns its receipt without waiting (<c>POST /watermarks/{media}/detect/async</c>).</summary>
     /// <param name="media"><c>images</c>, <c>documents</c> or <c>videos</c>.</param>
     /// <param name="file">File bytes (1 byte to 50 MB; PDFs and videos up to 20 MB).</param>
-    /// <param name="options">Filename and idempotency key. Storage options do not apply to detection.</param>
+    /// <param name="options">Filename, idempotency key and optional <see cref="RequestOptions.Accelerator"/>. Storage options do not apply to detection.</param>
     /// <param name="webhookId">Optional enabled webhook endpoint (<c>wh_…</c>) to notify on completion.</param>
     /// <param name="cancellationToken">Cancels the request; server work continues.</param>
     /// <returns>The job receipt.</returns>
@@ -216,39 +292,39 @@ public sealed partial class EtchvClient : IDisposable
     /// <summary>Watermarks an image and waits for the verified result, polling if processing continues.</summary>
     /// <param name="file">Image bytes (1 byte to 50 MB).</param>
     /// <param name="data">Non-empty JSON object of forensic data.</param>
-    /// <param name="options">Filename, idempotency key and optional storage destination.</param>
+    /// <param name="options">Filename, idempotency key, optional storage destination and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedImageAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("images", file, data, options, cancellationToken);
     /// <summary>Watermarks a PDF and waits for the verified result, polling if processing continues.</summary>
     /// <param name="file">PDF bytes (1 byte to 20 MB).</param>
     /// <param name="data">Non-empty JSON object of forensic data.</param>
-    /// <param name="options">Filename, idempotency key and optional storage destination.</param>
+    /// <param name="options">Filename, idempotency key, optional storage destination and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedDocumentAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("documents", file, data, options, cancellationToken);
     /// <summary>Watermarks a video and waits for the verified result, polling if processing continues.</summary>
     /// <param name="file">MP4 or MOV bytes (1 byte to 20 MB).</param>
     /// <param name="data">Non-empty JSON object of forensic data.</param>
-    /// <param name="options">Filename, idempotency key and optional storage destination.</param>
+    /// <param name="options">Filename, idempotency key, optional storage destination and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedVideoAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("videos", file, data, options, cancellationToken);
     /// <summary>Detects a watermark in an image synchronously.</summary>
     /// <param name="file">Image bytes (1 byte to 50 MB).</param>
-    /// <param name="options">Filename and optional idempotency key.</param>
+    /// <param name="options">Filename, optional idempotency key and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectImageAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("images", file, options, cancellationToken);
     /// <summary>Detects watermarks in a PDF synchronously, page by page.</summary>
     /// <param name="file">PDF bytes (1 byte to 20 MB).</param>
-    /// <param name="options">Filename and optional idempotency key.</param>
+    /// <param name="options">Filename, optional idempotency key and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectDocumentAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("documents", file, options, cancellationToken);
     /// <summary>Detects watermarks in a video, frame by frame, waiting for the durable job to finish.</summary>
     /// <param name="file">MP4 or MOV bytes (1 byte to 20 MB).</param>
-    /// <param name="options">Filename and optional idempotency key.</param>
+    /// <param name="options">Filename, optional idempotency key and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectVideoAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("videos", file, options, cancellationToken);
@@ -300,7 +376,7 @@ public sealed partial class EtchvClient : IDisposable
         };
     }
 
-    private sealed record Reply(byte[] Bytes, int Status, string? RequestId, string? WatermarkId, string ContentType, string Disposition, string? AssetId, string? SourceAssetId, string? StorageDeliveryId, string? RetryAfter);
+    private sealed record Reply(byte[] Bytes, int Status, string? RequestId, string? WatermarkId, string ContentType, string Disposition, string? AssetId, string? SourceAssetId, string? StorageDeliveryId, string? RetryAfter, string? Accelerator);
 
     /// <summary>Sends one request, reading at most 256 MB. Never follows redirects.</summary>
     private async Task<Reply> SendAsync(HttpMethod method, string path, HttpContent? content, string? idempotencyKey, CancellationToken ct)
@@ -325,7 +401,7 @@ public sealed partial class EtchvClient : IDisposable
             buffer.Write(chunk, 0, n);
         }
         return new(buffer.ToArray(), (int)response.StatusCode, requestId, Header("X-Watermark-ID"), response.Content.Headers.ContentType?.MediaType ?? "",
-            response.Content.Headers.ContentDisposition?.ToString() ?? "", Header("X-Asset-ID"), Header("X-Source-Asset-ID"), Header("X-Storage-Delivery-ID"), Header("Retry-After"));
+            response.Content.Headers.ContentDisposition?.ToString() ?? "", Header("X-Asset-ID"), Header("X-Source-Asset-ID"), Header("X-Storage-Delivery-ID"), Header("Retry-After"), Header("X-Etchv-Accelerator"));
     }
 
     private static string Truncate(byte[] bytes) => Encoding.UTF8.GetString(bytes.AsSpan(0, Math.Min(bytes.Length, MaxDetail)));
@@ -338,7 +414,7 @@ public sealed partial class EtchvClient : IDisposable
         {
             var content = json is null ? null : new StringContent(json, Encoding.UTF8, "application/json");
             var r = await SendAsync(method, path, content, null, deadline.Token).ConfigureAwait(false);
-            if (r.Status is < 200 or > 299) throw new EtchvException(r.Status, Truncate(r.Bytes), r.RequestId);
+            if (r.Status is < 200 or > 299) throw new EtchvException(r.Status, Truncate(r.Bytes), r.RequestId) { RetryAfter = ParseRetryAfter(r.RetryAfter) };
             return r;
         }
         catch (OperationCanceledException) when (!caller.IsCancellationRequested) { throw new EtchvException(0, "Client deadline exceeded"); }
@@ -370,6 +446,7 @@ public sealed partial class EtchvClient : IDisposable
             path += (path.Contains('?') ? "&" : "?") + "storage_destination_id=" + Uri.EscapeDataString(options.StorageDestinationId);
             if (options.StorageKey is not null) path += "&storage_key=" + Uri.EscapeDataString(options.StorageKey);
         }
+        if (options.Accelerator is { } accelerator) path += (path.Contains('?') ? "&" : "?") + "accelerator=" + Wire(accelerator);
         if (options.IdempotencyKey is not null) Check(options.IdempotencyKey, "[A-Za-z0-9_-]{8,128}", "idempotency key (use 8–128 letters, digits, hyphens or underscores)");
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(caller);
         deadline.CancelAfter(timeout); var ct = deadline.Token; string? requestId = null;
@@ -403,8 +480,8 @@ public sealed partial class EtchvClient : IDisposable
                         await Task.Delay(TimeSpan.FromSeconds(seconds), ct).ConfigureAwait(false); continue;
                     }
                     bool failed = detail.ValueKind == JsonValueKind.Object && detail.TryGetProperty("status", out var state) && state.ValueKind == JsonValueKind.String && state.GetString() == "failed";
-                    if (durable && r.Status is 429 or 502 or 503 or 504 && !failed) { await Task.Delay(1000, ct).ConfigureAwait(false); continue; }
-                    throw new EtchvException(r.Status, Truncate(r.Bytes), requestId, options.IdempotencyKey);
+                    if (durable && r.Status is 429 or 502 or 503 or 504 && !failed) { await Task.Delay(RetryDelay(r.RetryAfter), ct).ConfigureAwait(false); continue; }
+                    throw new EtchvException(r.Status, Truncate(r.Bytes), requestId, options.IdempotencyKey) { RetryAfter = ParseRetryAfter(r.RetryAfter) };
                 }
                 catch (Exception e) when (e is HttpRequestException or IOException)
                 {
@@ -417,12 +494,35 @@ public sealed partial class EtchvClient : IDisposable
         { throw new EtchvException(0, "Client deadline exceeded; job may still complete", requestId, options.IdempotencyKey); }
     }
 
+    /// <summary>
+    /// Delay before retrying a transient failure: <c>Retry-After</c> clamped to 0.01–5 seconds when present, otherwise
+    /// one second. The operation deadline still bounds the wait.
+    /// </summary>
+    private static TimeSpan RetryDelay(string? retryAfter) =>
+        ParseRetryAfter(retryAfter) is { } wait
+            ? TimeSpan.FromSeconds(Math.Clamp(wait.TotalSeconds, .01, 5))
+            : TimeSpan.FromSeconds(1);
+
+    /// <summary>Parses <c>Retry-After</c> as delta-seconds or an HTTP date (a past date is zero); null when absent or invalid.</summary>
+    private static TimeSpan? ParseRetryAfter(string? retryAfter)
+    {
+        if (string.IsNullOrWhiteSpace(retryAfter)) return null;
+        if (double.TryParse(retryAfter, NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds))
+            return double.IsFinite(seconds) && seconds >= 0 ? TimeSpan.FromSeconds(Math.Min(seconds, 86400)) : null;
+        if (RetryConditionHeaderValue.TryParse(retryAfter, out var value) && value.Date is { } date)
+        {
+            var wait = date - DateTimeOffset.UtcNow;
+            return wait <= TimeSpan.Zero ? TimeSpan.Zero : wait > TimeSpan.FromDays(1) ? TimeSpan.FromDays(1) : wait;
+        }
+        return null;
+    }
+
     private static EmbedResult Embedding(Reply r)
     {
         string? ext = Extension(r.Bytes, r.ContentType);
         if (ext is null || !ValidId(r.WatermarkId)) throw new EtchvException(200, "Invalid embedding response", r.RequestId);
         var match = Regex.Match(r.Disposition, "filename=\"?([A-Za-z0-9._-]+)\"?(?:;|$)");
-        return new(r.Bytes, r.WatermarkId!, r.RequestId, r.ContentType, match.Success ? match.Groups[1].Value : $"watermarked.{ext}", r.AssetId, r.SourceAssetId, r.StorageDeliveryId);
+        return new(r.Bytes, r.WatermarkId!, r.RequestId, r.ContentType, match.Success ? match.Groups[1].Value : $"watermarked.{ext}", r.AssetId, r.SourceAssetId, r.StorageDeliveryId, ParseAccelerator(r.Accelerator));
     }
 
     private static DetectionUnit Unit(JsonElement v, int index)
@@ -444,7 +544,9 @@ public sealed partial class EtchvClient : IDisposable
                 if (units.Count == 0) throw new FormatException();
             }
             else units.Add(top);
-            return new(top.Watermarked, top.Confidence, top.WatermarkId, r.RequestId, units.AsReadOnly());
+            var accelerator = ParseAccelerator(r.Accelerator)
+                ?? (v.TryGetProperty("accelerator", out var reported) && reported.ValueKind == JsonValueKind.String ? ParseAccelerator(reported.GetString()) : null);
+            return new(top.Watermarked, top.Confidence, top.WatermarkId, r.RequestId, units.AsReadOnly(), accelerator);
         }
         catch (Exception e) when (e is JsonException or FormatException or InvalidOperationException or KeyNotFoundException or OverflowException)
         { throw new EtchvException(200, "Invalid detection response", r.RequestId); }
