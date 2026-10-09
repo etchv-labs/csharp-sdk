@@ -191,7 +191,7 @@ public sealed record UploadSession(string UploadId, string Kind, string Filename
 public sealed partial class EtchvClient : IDisposable
 {
     /// <summary>SDK version.</summary>
-    public const string Version = "1.1.0";
+    public const string Version = "1.2.0";
     /// <summary>User-Agent sent with every request.</summary>
     public const string UserAgent = "etchv-csharp/" + Version;
     /// <summary>Maximum file size to watermark (50 MB). The API rejects PDFs and videos over 20 MB with status 413.</summary>
@@ -313,45 +313,119 @@ public sealed partial class EtchvClient : IDisposable
     /// <param name="cancellationToken">Cancels the upload.</param>
     /// <returns>The session, with status <c>received</c>.</returns>
     /// <exception cref="EtchvException">The session could not be created or the upload was refused.</exception>
-    public async Task<UploadSession> UploadFileAsync(string kind, byte[] file, string filename = "file", CancellationToken cancellationToken = default)
-    {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken); deadline.CancelAfter(timeout);
-        try { return await UploadAsync(kind, file, filename, deadline.Token).ConfigureAwait(false); }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { throw new EtchvException(0, "Client deadline exceeded"); }
-    }
+    public Task<UploadSession> UploadFileAsync(string kind, byte[] file, string filename = "file", CancellationToken cancellationToken = default) =>
+        UploadAsync(kind, file, filename, cancellationToken);
 
-    private async Task<UploadSession> UploadAsync(string kind, byte[] file, string filename, CancellationToken ct)
+    /// <summary>
+    /// Creates an upload session under the client timeout, then PUTs the file with <see cref="PutSignedAsync"/>, which
+    /// has no total deadline: it fails only when the transfer stalls.
+    /// </summary>
+    private async Task<UploadSession> UploadAsync(string kind, byte[] file, string filename, CancellationToken caller)
     {
         if (kind is not ("image" or "document" or "video" or "detect")) throw new ArgumentException("kind must be image, document, video or detect", nameof(kind));
         if (file is null || file.Length == 0) throw new ArgumentException("file must contain at least 1 byte", nameof(file));
         Reply created;
         var body = new StringContent(Body(new { Kind = kind, Filename = filename, Size = file.Length }), Encoding.UTF8, "application/json");
-        try { created = await SendAsync(HttpMethod.Post, "uploads", body, null, ct).ConfigureAwait(false); }
-        catch (Exception e) when (e is HttpRequestException or IOException) { throw new EtchvException(0, "Network error", null, null, e); }
+        using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(caller))
+        {
+            deadline.CancelAfter(timeout);
+            try { created = await SendAsync(HttpMethod.Post, "uploads", body, null, deadline.Token).ConfigureAwait(false); }
+            catch (Exception e) when (e is HttpRequestException or IOException) { throw new EtchvException(0, "Network error", null, null, e); }
+            catch (OperationCanceledException) when (!caller.IsCancellationRequested) { throw new EtchvException(0, "Client deadline exceeded"); }
+        }
         if (created.Status != 201) throw new EtchvException(created.Status, Truncate(created.Bytes), created.RequestId) { RetryAfter = ParseRetryAfter(created.RetryAfter) };
         var session = Parse<CreatedUpload>(created.Bytes, 201, created.RequestId);
         if (session.Upload is not { Method: "PUT" } upload || !Uri.TryCreate(upload.Url, UriKind.Absolute, out var target) || target.Scheme != "https")
             throw new EtchvException(201, "Invalid upload session response", created.RequestId);
+        await PutSignedAsync(target, () => new MemoryStream(file, false), file.Length, caller).ConfigureAwait(false);
+        return new(session.UploadId, session.Kind, session.Filename, session.Size, "received", session.ExpiresAt);
+    }
+
+    /// <summary>
+    /// PUTs a file to a signed upload URL. Each attempt fails only when it stalls: no request bytes sent, or no response
+    /// after the last byte, for the client timeout. Network errors and HTTP 5xx are retried every second for up to the
+    /// client timeout after the first failure; any other status fails at once. <paramref name="open"/> is called once
+    /// per attempt (so a file is reopened); an exception from it, or a file whose length is no longer
+    /// <paramref name="length"/>, fails at once without a retry.
+    /// </summary>
+    private async Task PutSignedAsync(Uri target, Func<Stream> open, long length, CancellationToken caller)
+    {
+        System.Diagnostics.Stopwatch? failing = null;
         while (true)
         {
-            ct.ThrowIfCancellationRequested();
+            caller.ThrowIfCancellationRequested();
+            using var idle = CancellationTokenSource.CreateLinkedTokenSource(caller);
+            idle.CancelAfter(timeout);
+            var content = new UploadContent(open(), length, () => idle.CancelAfter(timeout));
+            int status = 0; string detail; Exception? cause = null;
             try
             {
                 // The signed URL carries its own authorization: never send the API key there.
-                using var request = new HttpRequestMessage(HttpMethod.Put, target) { Content = new ByteArrayContent(file) };
+                using var request = new HttpRequestMessage(HttpMethod.Put, target) { Content = content };
                 request.Content.Headers.ContentType = new("application/octet-stream");
                 request.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
-                using var response = await http.SendAsync(request, ct).ConfigureAwait(false);
-                int status = (int)response.StatusCode;
-                if (status == 200) return new(session.UploadId, session.Kind, session.Filename, session.Size, "received", session.ExpiresAt);
-                if (status is not (500 or 502 or 503 or 504))
-                {
-                    var refused = await response.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
-                    throw new EtchvException(status, refused.Length == 0 ? "Upload refused" : Truncate(refused));
-                }
+                using var response = await http.SendAsync(request, idle.Token).ConfigureAwait(false);
+                status = (int)response.StatusCode;
+                if (status == 200) return;
+                var refused = await response.Content.ReadAsByteArrayAsync(idle.Token).ConfigureAwait(false);
+                detail = refused.Length == 0 ? "Upload refused" : Truncate(refused);
+                if (status is not (500 or 502 or 503 or 504)) throw new EtchvException(status, detail);
             }
-            catch (Exception e) when (e is HttpRequestException or IOException) { }
-            await Task.Delay(1000, ct).ConfigureAwait(false);
+            catch (Exception) when (content.Changed is not null) { throw content.Changed; }
+            catch (OperationCanceledException e) when (!caller.IsCancellationRequested) { detail = $"Upload stalled: no progress for {timeout}"; cause = new TimeoutException(detail, e); }
+            catch (Exception e) when (e is HttpRequestException or IOException) { detail = "Network error during upload"; cause = e; }
+            failing ??= System.Diagnostics.Stopwatch.StartNew();
+            if (failing.Elapsed >= timeout) throw new EtchvException(status, detail, null, null, cause);
+            await Task.Delay(1000, caller).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Thrown when a file being uploaded no longer has the length it had when the upload was planned.</summary>
+    internal sealed class FileChangedException(string message) : Exception(message);
+
+    /// <summary>Request content that streams exactly <c>length</c> bytes, reporting progress after each chunk.</summary>
+    private sealed class UploadContent : HttpContent
+    {
+        private readonly Stream source;
+        private readonly long length;
+        private readonly Action progress;
+        public FileChangedException? Changed { get; private set; }
+
+        public UploadContent(Stream source, long length, Action progress)
+        {
+            this.source = source; this.length = length; this.progress = progress;
+            if (source.CanSeek && source.Length is var actual && actual != length)
+            {
+                source.Dispose();
+                throw new FileChangedException($"the file is now {actual} bytes, not {length}");
+            }
+        }
+
+        protected override bool TryComputeLength(out long length) { length = this.length; return true; }
+
+        protected override Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context) => SerializeToStreamAsync(stream, context, CancellationToken.None);
+
+        protected override async Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context, CancellationToken cancellationToken)
+        {
+            if (source.CanSeek) source.Position = 0;
+            var chunk = new byte[64 * 1024];
+            long sent = 0;
+            while (true)
+            {
+                int n = await source.ReadAsync(chunk, cancellationToken).ConfigureAwait(false);
+                if (n == 0) break;
+                if (sent + n > length) throw Changed = new FileChangedException($"the file grew past {length} bytes during the upload");
+                await stream.WriteAsync(chunk.AsMemory(0, n), cancellationToken).ConfigureAwait(false);
+                sent += n;
+                progress();
+            }
+            if (sent != length) throw Changed = new FileChangedException($"the file shrank to {sent} bytes during the upload, not {length}");
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) source.Dispose();
+            base.Dispose(disposing);
         }
     }
 
@@ -466,9 +540,10 @@ public sealed partial class EtchvClient : IDisposable
 
     private sealed record Reply(byte[] Bytes, int Status, string? RequestId, string? WatermarkId, string ContentType, string Disposition, string? AssetId, string? SourceAssetId, string? StorageDeliveryId, string? RetryAfter, string? Accelerator);
 
-    /// <summary>Sends one request, reading at most 256 MB. Never follows redirects.</summary>
-    private async Task<Reply> SendAsync(HttpMethod method, string path, HttpContent? content, string? idempotencyKey, CancellationToken ct)
+    /// <summary>Sends one request, reading at most <paramref name="maxBytes"/> (default 256 MB). Never follows redirects.</summary>
+    private async Task<Reply> SendAsync(HttpMethod method, string path, HttpContent? content, string? idempotencyKey, CancellationToken ct, long maxBytes = MaxDownloadSize)
     {
+        string tooLarge = $"Response exceeds {maxBytes / (1024 * 1024)} MB";
         var target = new Uri(baseUrl + "/" + path);
         using var request = new HttpRequestMessage(method, target) { Content = content };
         request.Headers.TryAddWithoutValidation("X-API-Key", key);
@@ -479,13 +554,13 @@ public sealed partial class EtchvClient : IDisposable
         string? requestId = Header("X-Request-ID");
         if (response.RequestMessage?.RequestUri is { } final && final != target)
             throw new EtchvException((int)response.StatusCode, "Redirects are not followed; configure the HttpClient with AllowAutoRedirect = false", requestId, idempotencyKey);
-        if (response.Content.Headers.ContentLength > MaxDownloadSize) throw new EtchvException((int)response.StatusCode, "Response exceeds 256 MB", requestId, idempotencyKey);
+        if (response.Content.Headers.ContentLength > maxBytes) throw new EtchvException((int)response.StatusCode, tooLarge, requestId, idempotencyKey);
         using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var buffer = new MemoryStream();
         var chunk = new byte[81920]; int n;
         while ((n = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)
         {
-            if (buffer.Length + n > MaxDownloadSize) throw new EtchvException((int)response.StatusCode, "Response exceeds 256 MB", requestId, idempotencyKey);
+            if (buffer.Length + n > maxBytes) throw new EtchvException((int)response.StatusCode, tooLarge, requestId, idempotencyKey);
             buffer.Write(chunk, 0, n);
         }
         return new(buffer.ToArray(), (int)response.StatusCode, requestId, Header("X-Watermark-ID"), response.Content.Headers.ContentType?.MediaType ?? "",
@@ -536,19 +611,20 @@ public sealed partial class EtchvClient : IDisposable
         }
         if (options.Accelerator is { } accelerator) path += (path.Contains('?') ? "&" : "?") + "accelerator=" + Wire(accelerator);
         if (options.IdempotencyKey is not null) Check(options.IdempotencyKey, "[A-Za-z0-9_-]{8,128}", "idempotency key (use 8–128 letters, digits, hyphens or underscores)");
+        string? uploadId = null;
+        if (file is not null && file.Length > largeFileThreshold)
+        {
+            // Too large for one request body: upload once (bounded by stalls, not the client timeout); every retry
+            // sends the same upload_id.
+            var route = path.Split('?')[0];
+            string kind = route.Contains("/detect", StringComparison.Ordinal) ? "detect"
+                : route.Split('/')[1] switch { "documents" => "document", "videos" => "video", _ => "image" };
+            uploadId = (await UploadAsync(kind, file, options.Filename ?? "file", caller).ConfigureAwait(false)).UploadId;
+        }
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(caller);
         deadline.CancelAfter(timeout); var ct = deadline.Token; string? requestId = null;
         try
         {
-            string? uploadId = null;
-            if (file is not null && file.Length > largeFileThreshold)
-            {
-                // Too large for one request body: upload once; every retry sends the same upload_id.
-                var route = path.Split('?')[0];
-                string kind = route.Contains("/detect", StringComparison.Ordinal) ? "detect"
-                    : route.Split('/')[1] switch { "documents" => "document", "videos" => "video", _ => "image" };
-                uploadId = (await UploadAsync(kind, file, options.Filename ?? "file", ct).ConfigureAwait(false)).UploadId;
-            }
             while (true)
             {
                 ct.ThrowIfCancellationRequested();

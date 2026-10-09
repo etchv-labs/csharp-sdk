@@ -10,7 +10,7 @@
     <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
 
     <PackageId>Etchv</PackageId>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Authors>Etchv Labs</Authors>
     <Company>Etchv Labs</Company>
     <Product>Etchv</Product>

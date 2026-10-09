@@ -6,7 +6,7 @@ Server-side .NET client for [Etchv](https://etchv.com): embed and detect invisib
 
 ```sh
 # From your project folder: clone next to it, not inside it
-git clone --branch v1.0.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
+git clone --branch v1.2.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
 dotnet add reference ../etchv-csharp-sdk/src/Etchv/Etchv.csproj
 ```
 
@@ -54,13 +54,61 @@ delivered: up to 192 MB for images, 64 MB for PDFs and 100 MB for video.
 
 Files over 40 MB are uploaded once to a signed URL and then referenced by ID, so the request never
 carries the file. This is automatic in every embed, detect and submit method; retries reuse the same
-upload. Image and PDF detection above 95 MB runs as a background job and the call waits for it.
+upload. The upload has no total deadline; it fails only when no bytes move for the client timeout.
+Image and PDF detection above 95 MB runs as a background job and the call waits for it.
 Change the threshold with `new EtchvClient(key) { LargeFileThreshold = ... }`, or upload explicitly:
 
 ```csharp
 var upload = await client.UploadFileAsync("detect", delivered, "delivered.tiff");
 // upload.UploadId: send as the upload_id form field instead of file
 ```
+
+## Many files at once
+
+A batch watermarks up to 100 files in one call, each with its own data:
+
+```csharp
+var items = Directory.GetFiles("in", "*.pdf")
+    .Select(path => BatchItem.FromPath(path, new Dictionary<string, object?> { ["recipient"] = Path.GetFileNameWithoutExtension(path) }))
+    .ToList();
+var batch = await client.SubmitBatchAsync(items, new BatchOptions(Archive: true));
+
+// Waits for the batch to finish (up to 30 minutes here; 1 hour by default), then downloads as you go.
+await foreach (var item in client.IterBatchResultsAsync(batch.BatchId, TimeSpan.FromMinutes(30)))
+{
+    if (item.Ok) await File.WriteAllBytesAsync(Path.Combine("out", item.Result!.Filename), item.Result.Bytes);
+    else Console.WriteLine($"{item.Filename}: {item.ErrorCode}"); // credits refunded
+}
+
+// Or everything in one zip, streamed to disk.
+await using var zip = File.Create("out.zip");
+long bytes = await client.DownloadBatchArchiveAsync(batch.BatchId, zip);
+```
+
+`SubmitBatchAsync` sends each file straight to its own signed upload URL (never with your API key), up to four at a
+time (`BatchOptions.UploadConcurrency`), then starts the batch. Files can be bytes (`new BatchItem(filename, bytes, data)`)
+or paths (`BatchItem.FromPath`). The `Idempotency-Key` makes resubmitting safe: if an upload fails, submit again with the
+same `BatchOptions.IdempotencyKey` (also on the exception) and only the missing files are uploaded. A file that changes
+size after the batch is created fails at once. Uploads have no total deadline: one fails only when no bytes move for the
+client timeout. Files that are rejected or fail are refunded and reported with an `ErrorCode` (`cancelled` or `expired`
+for files of a canceled or expired batch). Upload URLs last 6 hours and a batch must start within 24 hours; resubmitting
+an expired batch's idempotency key raises HTTP 410 with `Code` `batch_expired`, so use a new key. Results and the archive (`Archive: true`, up to
+1 GB of results) are kept for 24 hours.
+
+`WaitForBatchAsync`, `IterBatchResultsAsync` and `DownloadBatchArchiveAsync` take a wait timeout (default 1 hour) and
+wait as long as the API's `Retry-After` asks (at least 1 second) between polls. The archive download fails with status 0 and an inner
+`TimeoutException` when the archive is not ready in time or when the download stalls; it raises HTTP 409 with `Code`
+`batch_not_started`, `archive_not_requested`, `archive_too_large` or `archive_unavailable`, and HTTP 410 once expired.
+`DownloadBatchArchiveAsync(id)` without a stream returns the bytes.
+
+Files already together in a zip (up to 55 MB) go in one request with a manifest naming every member:
+
+```csharp
+var batch = await client.SubmitBatchZipAsync(await File.ReadAllBytesAsync("contracts.zip"),
+    [new BatchZipItem("contracts/acme.pdf", new Dictionary<string, object?> { ["recipient"] = "acme" })]);
+```
+
+Also: `GetBatchAsync`, `CancelBatchAsync` (files not yet running are refunded) and `ListBatchesAsync`.
 
 ## GPU processing
 
@@ -80,11 +128,13 @@ include `AcceleratorRequested` and `Accelerator`. Omit the option for CPU (the d
 
 Durable operations (embedding, video detection, job results) retry network errors and HTTP 429, 502, 503 and 504
 with the same idempotency key, waiting for `Retry-After` (up to 5 seconds per wait) when the API sends it, until the
-client timeout.
+client timeout. Batch calls do the same, except that creating a batch does not retry HTTP 503 (batch uploads
+unavailable; send a zip instead).
 
 ## Also included
 
 - API key check: `GetApiKeyInfoAsync`
+- Batches: `SubmitBatchAsync`, `SubmitBatchZipAsync`, `GetBatchAsync`, `WaitForBatchAsync`, `IterBatchResultsAsync`, `DownloadBatchArchiveAsync`, `CancelBatchAsync`, `ListBatchesAsync`
 - Assets: `ListAssetsAsync`, `GetAssetAsync`, `UpdateAssetAsync`, `DeleteAssetAsync`, `DeleteAssetsAsync`, `DownloadAssetAsync`
 - Webhooks: `ListWebhooksAsync`, `CreateWebhookAsync`, `UpdateWebhookAsync`, `DeleteWebhookAsync`, `ListWebhookDeliveriesAsync`, `RedeliverWebhookAsync`, and `WebhookSignature.Verify`
 - Customer storage: `ListStorageDestinationsAsync`, `CreateStorageDestinationAsync`, `UpdateStorageDestinationAsync`, `DeleteStorageDestinationAsync`, `VerifyStorageDestinationAsync`, `ListStorageDeliveriesAsync`, `CreateStorageDeliveryAsync`, `GetStorageDeliveryAsync`, `RetryStorageDeliveryAsync`, `DownloadStorageDeliveryAsync`
