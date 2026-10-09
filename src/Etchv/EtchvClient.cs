@@ -174,6 +174,15 @@ public sealed record JobReceipt(string RequestId, string Status, string Operatio
 /// <param name="Scopes">Scopes granted to the key.</param>
 public sealed record ApiKeyInfo(string OrganizationId, string KeyId, IReadOnlyList<string> Scopes);
 
+/// <summary>An upload session: one file uploaded to a signed URL, used once by an embed or detect request.</summary>
+/// <param name="UploadId">Session ID (<c>upl_…</c>); send it as the <c>upload_id</c> form field instead of the file.</param>
+/// <param name="Kind"><c>image</c>, <c>document</c>, <c>video</c> or <c>detect</c>.</param>
+/// <param name="Filename">File name recorded for the upload.</param>
+/// <param name="Size">File size in bytes.</param>
+/// <param name="Status"><c>received</c> once uploaded.</param>
+/// <param name="ExpiresAt">When the session expires (ISO 8601).</param>
+public sealed record UploadSession(string UploadId, string Kind, string Filename, long Size, string Status, string ExpiresAt);
+
 /// <summary>
 /// Server-side Etchv API client, authenticated with an API key sent as <c>X-API-Key</c>.
 /// Thread-safe; create one per application. Disposing releases the HTTP connection pool unless
@@ -182,11 +191,16 @@ public sealed record ApiKeyInfo(string OrganizationId, string KeyId, IReadOnlyLi
 public sealed partial class EtchvClient : IDisposable
 {
     /// <summary>SDK version.</summary>
-    public const string Version = "1.0.0";
+    public const string Version = "1.1.0";
     /// <summary>User-Agent sent with every request.</summary>
     public const string UserAgent = "etchv-csharp/" + Version;
-    /// <summary>Maximum upload size (50 MB). The API rejects PDFs and videos over 20 MB with status 413.</summary>
+    /// <summary>Maximum file size to watermark (50 MB). The API rejects PDFs and videos over 20 MB with status 413.</summary>
     public const int MaxFileSize = 50 * 1024 * 1024;
+    /// <summary>Maximum file size to detect (192 MB): files Etchv delivered. PDFs stop at 64 MB and videos at 100 MB.</summary>
+    public const int MaxDetectionFileSize = 192 * 1024 * 1024;
+    /// <summary>Default <see cref="LargeFileThreshold"/> (40 MB).</summary>
+    public const int DefaultLargeFileThreshold = 40 * 1024 * 1024;
+    private const int MaxSyncDetectionFileSize = 95 * 1024 * 1024;
     /// <summary>Maximum response or result file size (256 MB).</summary>
     public const int MaxDownloadSize = 256 * 1024 * 1024;
     private const int MaxDetail = 10000;
@@ -196,6 +210,17 @@ public sealed partial class EtchvClient : IDisposable
     private readonly string key;
     private readonly string baseUrl;
     private readonly TimeSpan timeout;
+    private readonly int largeFileThreshold = DefaultLargeFileThreshold;
+
+    /// <summary>
+    /// Files larger than this many bytes are uploaded once to a signed URL and referenced by <c>upload_id</c>
+    /// instead of being sent in the request body (default 40 MB). Retries reuse the same upload.
+    /// </summary>
+    public int LargeFileThreshold
+    {
+        get => largeFileThreshold;
+        init => largeFileThreshold = value > 0 ? value : throw new ArgumentException("LargeFileThreshold must be positive", nameof(value));
+    }
     private static bool ValidId(string? id) => id is not null && Regex.IsMatch(id, "\\A[0-9a-fA-F]{64}\\z");
     private static bool ValidJob(string? id) => id is not null && Regex.IsMatch(id, "\\Areq_[0-9a-f]{64}\\z");
     private static string Check(string? id, string pattern, string name) =>
@@ -272,10 +297,66 @@ public sealed partial class EtchvClient : IDisposable
     {
         if (media is not ("images" or "documents" or "videos")) throw new ArgumentException("media must be images, documents or videos", nameof(media));
         if (webhookId is not null) Check(webhookId, "wh_[a-f0-9]{32}", "webhook ID");
-        options = Prepare(media, file, options, true);
+        options = Prepare(media, file, options, true, detect: data is null);
         var r = await RequestAsync($"watermarks/{media}" + (data is null ? "/detect" : "") + "/async" + (webhookId is null ? "" : "?webhook_id=" + webhookId), file, data, options, true, data is null, ct).ConfigureAwait(false);
         return Parse<JobReceipt>(r.Bytes, 202, r.RequestId);
     }
+
+    /// <summary>
+    /// Uploads a file once to a signed URL (<c>POST /uploads</c>, then a PUT that never carries the API key) and returns the session.
+    /// Pass its <see cref="UploadSession.UploadId"/> as the <c>upload_id</c> form field instead of the file. Embed, detect and
+    /// submit methods do this automatically above <see cref="LargeFileThreshold"/>.
+    /// </summary>
+    /// <param name="kind"><c>image</c>, <c>document</c>, <c>video</c> or <c>detect</c>.</param>
+    /// <param name="file">File bytes.</param>
+    /// <param name="filename">Original file name.</param>
+    /// <param name="cancellationToken">Cancels the upload.</param>
+    /// <returns>The session, with status <c>received</c>.</returns>
+    /// <exception cref="EtchvException">The session could not be created or the upload was refused.</exception>
+    public async Task<UploadSession> UploadFileAsync(string kind, byte[] file, string filename = "file", CancellationToken cancellationToken = default)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken); deadline.CancelAfter(timeout);
+        try { return await UploadAsync(kind, file, filename, deadline.Token).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { throw new EtchvException(0, "Client deadline exceeded"); }
+    }
+
+    private async Task<UploadSession> UploadAsync(string kind, byte[] file, string filename, CancellationToken ct)
+    {
+        if (kind is not ("image" or "document" or "video" or "detect")) throw new ArgumentException("kind must be image, document, video or detect", nameof(kind));
+        if (file is null || file.Length == 0) throw new ArgumentException("file must contain at least 1 byte", nameof(file));
+        Reply created;
+        var body = new StringContent(Body(new { Kind = kind, Filename = filename, Size = file.Length }), Encoding.UTF8, "application/json");
+        try { created = await SendAsync(HttpMethod.Post, "uploads", body, null, ct).ConfigureAwait(false); }
+        catch (Exception e) when (e is HttpRequestException or IOException) { throw new EtchvException(0, "Network error", null, null, e); }
+        if (created.Status != 201) throw new EtchvException(created.Status, Truncate(created.Bytes), created.RequestId) { RetryAfter = ParseRetryAfter(created.RetryAfter) };
+        var session = Parse<CreatedUpload>(created.Bytes, 201, created.RequestId);
+        if (session.Upload is not { Method: "PUT" } upload || !Uri.TryCreate(upload.Url, UriKind.Absolute, out var target) || target.Scheme != "https")
+            throw new EtchvException(201, "Invalid upload session response", created.RequestId);
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                // The signed URL carries its own authorization: never send the API key there.
+                using var request = new HttpRequestMessage(HttpMethod.Put, target) { Content = new ByteArrayContent(file) };
+                request.Content.Headers.ContentType = new("application/octet-stream");
+                request.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
+                using var response = await http.SendAsync(request, ct).ConfigureAwait(false);
+                int status = (int)response.StatusCode;
+                if (status == 200) return new(session.UploadId, session.Kind, session.Filename, session.Size, "received", session.ExpiresAt);
+                if (status is not (500 or 502 or 503 or 504))
+                {
+                    var refused = await response.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
+                    throw new EtchvException(status, refused.Length == 0 ? "Upload refused" : Truncate(refused));
+                }
+            }
+            catch (Exception e) when (e is HttpRequestException or IOException) { }
+            await Task.Delay(1000, ct).ConfigureAwait(false);
+        }
+    }
+
+    private sealed record CreatedUpload(string UploadId, string Kind, string Filename, long Size, string Status, string ExpiresAt, UploadTarget? Upload);
+    private sealed record UploadTarget(string Method, string Url, string ExpiresAt);
 
     /// <summary>Reads a job's status without waiting (<c>GET /watermarks/jobs/{id}</c> or <c>/watermarks/detection-jobs/{id}</c>).</summary>
     /// <param name="requestId">Job ID (<c>req_…</c>).</param>
@@ -360,14 +441,21 @@ public sealed partial class EtchvClient : IDisposable
 
     private async Task<DetectionResult> DetectAsync(string media, byte[] file, RequestOptions? options, CancellationToken ct)
     {
+        if (media != "videos" && file is { Length: > MaxSyncDetectionFileSize })
+        {
+            // Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job.
+            var receipt = await SubmitDetectionAsync(media, file, options, null, ct).ConfigureAwait(false);
+            return await GetDetectionResultAsync(receipt.RequestId, ct).ConfigureAwait(false);
+        }
         bool durable = media == "videos";
-        options = Prepare(media, file, options, durable);
+        options = Prepare(media, file, options, durable, detect: true);
         return Detection(await RequestAsync($"watermarks/{media}/detect", file, null, options, durable, durable, ct).ConfigureAwait(false));
     }
 
-    private static RequestOptions Prepare(string media, byte[] file, RequestOptions? options, bool durable)
+    private static RequestOptions Prepare(string media, byte[] file, RequestOptions? options, bool durable, bool detect = false)
     {
-        if (file is null || file.Length == 0 || file.Length > MaxFileSize) throw new ArgumentException("file must contain 1 byte to 50 MB", nameof(file));
+        int limit = detect ? MaxDetectionFileSize : MaxFileSize;
+        if (file is null || file.Length == 0 || file.Length > limit) throw new ArgumentException($"file must contain 1 byte to {limit / (1024 * 1024)} MB", nameof(file));
         options ??= new();
         return options with
         {
@@ -452,13 +540,24 @@ public sealed partial class EtchvClient : IDisposable
         deadline.CancelAfter(timeout); var ct = deadline.Token; string? requestId = null;
         try
         {
+            string? uploadId = null;
+            if (file is not null && file.Length > largeFileThreshold)
+            {
+                // Too large for one request body: upload once; every retry sends the same upload_id.
+                var route = path.Split('?')[0];
+                string kind = route.Contains("/detect", StringComparison.Ordinal) ? "detect"
+                    : route.Split('/')[1] switch { "documents" => "document", "videos" => "video", _ => "image" };
+                uploadId = (await UploadAsync(kind, file, options.Filename ?? "file", ct).ConfigureAwait(false)).UploadId;
+            }
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
                 MultipartFormDataContent? form = null;
                 if (file is not null)
                 {
-                    form = new MultipartFormDataContent { { new ByteArrayContent(file), "file", options.Filename ?? "file" } };
+                    form = uploadId is null
+                        ? new MultipartFormDataContent { { new ByteArrayContent(file), "file", options.Filename ?? "file" } }
+                        : new MultipartFormDataContent { { new StringContent(uploadId, Encoding.UTF8), "upload_id" } };
                     if (data is not null) form.Add(new StringContent(data, Encoding.UTF8), "data");
                 }
                 try
