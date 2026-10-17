@@ -113,7 +113,7 @@ public sealed record RequestOptions(string? Filename = null, string? Idempotency
 
 /// <summary>A verified watermarked file.</summary>
 /// <param name="Bytes">Watermarked file bytes in the original format.</param>
-/// <param name="WatermarkId">The embedded 256-bit watermark ID as 64 hexadecimal characters.</param>
+/// <param name="WatermarkId">The unique forensic watermark ID for this file: 256 bits as 64 hexadecimal characters.</param>
 /// <param name="RequestId">The Etchv request (job) ID.</param>
 /// <param name="ContentType">MIME type of <paramref name="Bytes"/>.</param>
 /// <param name="Filename">Suggested filename for the result.</param>
