@@ -70,7 +70,7 @@ internal sealed class FixtureServer : IDisposable
                     }
                     else if (detection)
                     {
-                        JsonObject Unit(int i) => new() { ["index"] = i, ["watermarked"] = true, ["confidence"] = .99, ["watermark_id"] = id };
+                        JsonObject Unit(int i) => new() { ["index"] = i, ["watermarked"] = true, ["confidence"] = .99, ["watermark_id"] = id, ["part"] = i == 0 && ext is "docx" or "pptx" ? "media/image1.png" : null };
                         json = new JsonObject { ["watermarked"] = true, ["confidence"] = scenario == "bad-detection" ? 1.5 : .99, ["watermark_id"] = id, ["units"] = new JsonArray(Unit(0), Unit(scenario == "bad-units" ? 4 : 1)) };
                     }
                     break;

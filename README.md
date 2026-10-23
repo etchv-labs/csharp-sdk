@@ -6,7 +6,7 @@ Server-side .NET client for [Etchv](https://etchv.com): embed and detect invisib
 
 ```sh
 # From your project folder: clone next to it, not inside it
-git clone --branch v1.2.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
+git clone --branch v1.3.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
 dotnet add reference ../etchv-csharp-sdk/src/Etchv/Etchv.csproj
 ```
 
@@ -49,13 +49,14 @@ Detection uses `SubmitDetectionAsync`, `GetJobAsync(id, detect: true)` and `GetD
 
 ## Limits and large files
 
-Image uploads are limited to 50 MB; PDF and video uploads to 20 MB. Detection takes the files Etchv
-delivered: up to 192 MB for images, 64 MB for PDFs and 100 MB for video.
+Image uploads are limited to 50 MB; document and video uploads to 20 MB. Detection takes the files Etchv
+delivered: up to 192 MB for images, 64 MB for PDFs and 100 MB for DOCX, PPTX and
+video.
 
 Files over 40 MB are uploaded once to a signed URL and then referenced by ID, so the request never
 carries the file. This is automatic in every embed, detect and submit method; retries reuse the same
 upload. The upload has no total deadline; it fails only when no bytes move for the client timeout.
-Image and PDF detection above 95 MB runs as a background job and the call waits for it.
+Image and document detection above 95 MB runs as a background job and the call waits for it.
 Change the threshold with `new EtchvClient(key) { LargeFileThreshold = ... }`, or upload explicitly:
 
 ```csharp

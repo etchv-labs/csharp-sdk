@@ -123,12 +123,17 @@ public sealed record RequestOptions(string? Filename = null, string? Idempotency
 /// <param name="Accelerator">Hardware that actually processed the file (<c>X-Etchv-Accelerator</c>), or null when not reported.</param>
 public sealed record EmbedResult(byte[] Bytes, string WatermarkId, string? RequestId, string ContentType, string Filename, string? AssetId = null, string? SourceAssetId = null, string? StorageDeliveryId = null, Accelerator? Accelerator = null);
 
-/// <summary>Detection result for one frame, page or composite.</summary>
+/// <summary>Detection result for one frame, page, composite or DOCX/PPTX unit.</summary>
 /// <param name="Index">Zero-based unit index.</param>
 /// <param name="Watermarked">Whether this unit carries a watermark.</param>
 /// <param name="Confidence">Certainty between 0 and 1.</param>
 /// <param name="WatermarkId">Decoded watermark ID, or null.</param>
-public sealed record DetectionUnit(int Index, bool Watermarked, double Confidence, string? WatermarkId);
+public sealed record DetectionUnit(int Index, bool Watermarked, double Confidence, string? WatermarkId)
+{
+    /// <summary>DOCX/PPTX only: the package part that carries this unit, otherwise null.</summary>
+    /// <remarks>An init-only property rather than a positional parameter, so the 1.2.0 constructor and <c>Deconstruct</c> keep working.</remarks>
+    public string? Part { get; init; }
+}
 
 /// <summary>Detection result for a file.</summary>
 /// <param name="Watermarked">True only when every unit carries the same watermark.</param>
@@ -191,7 +196,7 @@ public sealed record UploadSession(string UploadId, string Kind, string Filename
 public sealed partial class EtchvClient : IDisposable
 {
     /// <summary>SDK version.</summary>
-    public const string Version = "1.2.0";
+    public const string Version = "1.3.0";
     /// <summary>User-Agent sent with every request.</summary>
     public const string UserAgent = "etchv-csharp/" + Version;
     /// <summary>Maximum file size to watermark (50 MB). The API rejects PDFs and videos over 20 MB with status 413.</summary>
@@ -451,15 +456,15 @@ public sealed partial class EtchvClient : IDisposable
     /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedImageAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("images", file, data, options, cancellationToken);
-    /// <summary>Watermarks a PDF and waits for the verified result, polling if processing continues.</summary>
-    /// <param name="file">PDF bytes (1 byte to 20 MB).</param>
+    /// <summary>Watermarks a PDF, DOCX or PPTX and waits for the verified result, polling if processing continues.</summary>
+    /// <param name="file">PDF, DOCX or PPTX bytes (1 byte to 20 MB).</param>
     /// <param name="data">Non-empty JSON object of forensic data.</param>
     /// <param name="options">Filename, idempotency key, optional storage destination and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedDocumentAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("documents", file, data, options, cancellationToken);
     /// <summary>Watermarks a video and waits for the verified result, polling if processing continues.</summary>
-    /// <param name="file">MP4 or MOV bytes (1 byte to 20 MB).</param>
+    /// <param name="file">MP4, MOV, WebM, Matroska, MPEG or AVI bytes (1 byte to 20 MB).</param>
     /// <param name="data">Non-empty JSON object of forensic data.</param>
     /// <param name="options">Filename, idempotency key, optional storage destination and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
@@ -471,14 +476,14 @@ public sealed partial class EtchvClient : IDisposable
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectImageAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("images", file, options, cancellationToken);
-    /// <summary>Detects watermarks in a PDF synchronously, page by page.</summary>
-    /// <param name="file">PDF bytes (1 byte to 20 MB).</param>
+    /// <summary>Detects watermarks in a PDF (page by page), DOCX or PPTX synchronously.</summary>
+    /// <param name="file">PDF, DOCX or PPTX bytes (1 byte to 20 MB).</param>
     /// <param name="options">Filename, optional idempotency key and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectDocumentAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("documents", file, options, cancellationToken);
     /// <summary>Detects watermarks in a video, frame by frame, waiting for the durable job to finish.</summary>
-    /// <param name="file">MP4 or MOV bytes (1 byte to 20 MB).</param>
+    /// <param name="file">MP4, MOV, WebM, Matroska, MPEG or AVI bytes (1 byte to 20 MB).</param>
     /// <param name="options">Filename, optional idempotency key and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
@@ -705,7 +710,8 @@ public sealed partial class EtchvClient : IDisposable
         bool w = v.GetProperty("watermarked").GetBoolean(); double c = v.GetProperty("confidence").GetDouble();
         string? id = v.GetProperty("watermark_id").GetString();
         if (!double.IsFinite(c) || c < 0 || c > 1 || (w ? !ValidId(id) : id is not null)) throw new FormatException();
-        return new(index, w, c, id);
+        string? part = v.TryGetProperty("part", out var p) ? p.GetString() : null;
+        return new(index, w, c, id) { Part = part };
     }
 
     private static DetectionResult Detection(Reply r)
@@ -745,6 +751,13 @@ public sealed partial class EtchvClient : IDisposable
             "application/pdf" when Text("%PDF-") => "pdf",
             "video/mp4" when Text("ftyp", 4) => "mp4",
             "video/quicktime" when Text("ftyp", 4) => "mov",
+            "video/webm" when Starts([0x1a, 0x45, 0xdf, 0xa3]) => "webm",
+            "video/x-matroska" when Starts([0x1a, 0x45, 0xdf, 0xa3]) => "mkv",
+            "video/mpeg" when Starts([0, 0, 1, 0xba]) => "mpg",
+            "video/mp2t" when b.Length > 376 && b[0] == 0x47 && b[188] == 0x47 && b[376] == 0x47 => "ts",
+            "video/x-msvideo" when Text("RIFF") && Text("AVI ", 8) => "avi",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" when Starts([80, 75, 3, 4]) => "docx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation" when Starts([80, 75, 3, 4]) => "pptx",
             _ => null
         };
     }

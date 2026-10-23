@@ -31,7 +31,13 @@ public sealed class ContractTests
                 _ => await c.DetectImageAsync(bytes, options)
             };
             Check(detection.Watermarked && detection.Units.Count == 2);
+            Check(detection.Units[0].Part == (ext is "docx" or "pptx" ? "media/image1.png" : null));
         }
+        // The 1.2.0 shape still compiles and runs: four-argument constructor and four-value Deconstruct.
+        var legacy = new DetectionUnit(1, true, 0.9, "wm_x");
+        var (legacyIndex, legacyWatermarked, legacyConfidence, legacyId) = legacy;
+        Check(legacy.Part is null && legacyIndex == 1 && legacyWatermarked && legacyConfidence == 0.9 && legacyId == "wm_x");
+        Check(legacy with { Part = "word/document.xml" } != legacy);
         foreach (var scenario in new[] { "retry", "embed-job", "detect-job", "failed", "redirect", "invalid", "bad-job", "bad-id", "bad-detection", "bad-units", "deadline" })
         {
             var ext = scenario switch { "embed-job" => "pdf", "detect-job" => "mp4", _ => "png" };
