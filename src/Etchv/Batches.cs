@@ -8,7 +8,7 @@ public sealed class BatchItem
 {
     /// <summary>A file held in memory.</summary>
     /// <param name="filename">The file's name (1–255 characters); its extension sets the media type.</param>
-    /// <param name="file">File bytes (images up to 50 MB; PDFs and videos up to 20 MB).</param>
+    /// <param name="file">File bytes (images and PDFs up to 50 MB; DOCX, PPTX and videos up to 20 MB).</param>
     /// <param name="data">Non-empty JSON object of forensic data for this file.</param>
     public BatchItem(string filename, byte[] file, IReadOnlyDictionary<string, object?> data)
     {
@@ -52,7 +52,14 @@ public sealed class BatchItem
 /// <param name="IdempotencyKey">8–128 letters, digits, hyphens or underscores. Generated when omitted; submitting again with the same key resumes the same batch.</param>
 /// <param name="UploadConcurrency">Files uploaded at the same time (default 4).</param>
 public sealed record BatchOptions(bool Archive = false, string? WebhookId = null, Accelerator? Accelerator = null, string? StorageDestinationId = null,
-    string? IdempotencyKey = null, int UploadConcurrency = 4);
+    string? IdempotencyKey = null, int UploadConcurrency = 4)
+{
+    /// <summary>
+    /// For every file, as for <see cref="RequestOptions.ActiveContent"/>; omitted by default (<see cref="Etchv.ActiveContent.Keep"/>).
+    /// With <see cref="Etchv.ActiveContent.RemoveAutoRun"/> every file must be a PDF (HTTP 422 otherwise).
+    /// </summary>
+    public ActiveContent? ActiveContent { get; init; }
+}
 
 /// <summary>One zip member in <see cref="EtchvClient.SubmitBatchZipAsync"/>.</summary>
 /// <param name="Filename">The member's path, exactly as stored in the zip.</param>
@@ -126,6 +133,8 @@ public sealed record Batch(string BatchId, string Status, int ItemCount, bool Ar
 {
     /// <summary>Every file in index order; empty in <see cref="EtchvClient.ListBatchesAsync"/>.</summary>
     public IReadOnlyList<BatchItemStatus> Items { get; init; } = Items ?? [];
+    /// <summary>What the batch's PDFs keep of their scripts and actions, or null when not reported.</summary>
+    public ActiveContent? ActiveContent { get; init; }
     /// <summary>True when the batch is <c>completed</c>, <c>failed</c>, <c>cancelled</c> or <c>expired</c>.</summary>
     public bool IsTerminal => Status is "completed" or "failed" or "cancelled" or "expired";
 }
@@ -519,6 +528,7 @@ public sealed partial class EtchvClient
         if (options.WebhookId is not null) Check(options.WebhookId, "wh_[a-f0-9]{32}", "webhook ID");
         if (options.StorageDestinationId is not null) Check(options.StorageDestinationId, "dst_[a-f0-9]{32}", "storage destination ID");
         if (options.Accelerator is { } accelerator) Wire(accelerator);
+        if (options.ActiveContent is { } activeContent) Wire(activeContent);
         if (options.IdempotencyKey is not null) Check(options.IdempotencyKey, "[A-Za-z0-9_-]{8,128}", "idempotency key (use 8–128 letters, digits, hyphens or underscores)");
         return options with { IdempotencyKey = options.IdempotencyKey ?? Guid.NewGuid().ToString() };
     }
@@ -535,6 +545,7 @@ public sealed partial class EtchvClient
         if (options.WebhookId is not null) body["webhook_id"] = options.WebhookId;
         if (options.Accelerator is { } accelerator) body["accelerator"] = Wire(accelerator);
         if (options.StorageDestinationId is not null) body["storage_destination_id"] = options.StorageDestinationId;
+        if (options.ActiveContent is { } activeContent) body["active_content"] = Wire(activeContent);
         return body;
     }
 

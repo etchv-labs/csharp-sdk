@@ -86,17 +86,29 @@ public enum Accelerator
     Gpu,
 }
 
-/// <summary>Reads <c>"cpu"</c> or <c>"gpu"</c>; any other value becomes null rather than failing the response.</summary>
-internal sealed class AcceleratorJsonConverter : JsonConverter<Accelerator?>
+/// <summary>What PDF watermarking does with scripts and actions, sent as the <c>active_content</c> query parameter. PDF only.</summary>
+public enum ActiveContent
 {
-    public override Accelerator? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    /// <summary>Scripts, actions, form fields and attachments come back exactly as uploaded (the API default).</summary>
+    Keep,
+    /// <summary>
+    /// Also removes what a PDF viewer runs by itself: the open action, document and page actions, document-level
+    /// JavaScript and XFA forms. Links, form fields and attachments stay. The API refuses it for DOCX and PPTX (HTTP 422).
+    /// </summary>
+    RemoveAutoRun,
+}
+
+/// <summary>Reads an option's wire value; any other value becomes null rather than failing the response.</summary>
+internal sealed class WireJsonConverter<T>(Func<string?, T?> parse, Func<T, string> wire) : JsonConverter<T?> where T : struct, Enum
+{
+    public override T? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         if (reader.TokenType != JsonTokenType.String) { reader.Skip(); return null; }
-        return EtchvClient.ParseAccelerator(reader.GetString());
+        return parse(reader.GetString());
     }
-    public override void Write(Utf8JsonWriter writer, Accelerator? value, JsonSerializerOptions options)
+    public override void Write(Utf8JsonWriter writer, T? value, JsonSerializerOptions options)
     {
-        if (value is null) writer.WriteNullValue(); else writer.WriteStringValue(EtchvClient.Wire(value.Value));
+        if (value is null) writer.WriteNullValue(); else writer.WriteStringValue(wire(value.Value));
     }
 }
 
@@ -109,7 +121,14 @@ internal sealed class AcceleratorJsonConverter : JsonConverter<Accelerator?>
 /// Processing hardware; omitted by default (CPU). <see cref="Etchv.Accelerator.Gpu"/> requires the Business plan or higher
 /// (HTTP 403 otherwise) and costs 3× credits. When no GPU is ready, the job runs on CPU at normal credits.
 /// </param>
-public sealed record RequestOptions(string? Filename = null, string? IdempotencyKey = null, string? StorageDestinationId = null, string? StorageKey = null, Accelerator? Accelerator = null);
+public sealed record RequestOptions(string? Filename = null, string? IdempotencyKey = null, string? StorageDestinationId = null, string? StorageKey = null, Accelerator? Accelerator = null)
+{
+    /// <summary>
+    /// PDF embedding only: <see cref="Etchv.ActiveContent.RemoveAutoRun"/> removes what a viewer runs by itself;
+    /// omitted by default (<see cref="Etchv.ActiveContent.Keep"/>). Other media and detection throw <see cref="ArgumentException"/>.
+    /// </summary>
+    public ActiveContent? ActiveContent { get; init; }
+}
 
 /// <summary>A verified watermarked file.</summary>
 /// <param name="Bytes">Watermarked file bytes in the original format.</param>
@@ -196,12 +215,16 @@ public sealed record UploadSession(string UploadId, string Kind, string Filename
 public sealed partial class EtchvClient : IDisposable
 {
     /// <summary>SDK version.</summary>
-    public const string Version = "1.3.0";
+    public const string Version = "1.4.0";
     /// <summary>User-Agent sent with every request.</summary>
     public const string UserAgent = "etchv-csharp/" + Version;
-    /// <summary>Maximum file size to watermark (50 MB). The API rejects PDFs and videos over 20 MB with status 413.</summary>
+    /// <summary>
+    /// Maximum file size to watermark (50 MB) for images and PDFs. The API rejects DOCX, PPTX and videos over 20 MB with
+    /// status 413. A PDF has 1 to 2,000 pages, and its watermarked copy must fit in 95 MB with 48 KB per page, so a
+    /// 2,000-page PDF can be up to about 1 MB.
+    /// </summary>
     public const int MaxFileSize = 50 * 1024 * 1024;
-    /// <summary>Maximum file size to detect (192 MB): files Etchv delivered. PDFs stop at 64 MB and videos at 100 MB.</summary>
+    /// <summary>Maximum file size to detect (192 MB): files Etchv delivered. PDFs stop at 95 MB; DOCX, PPTX and videos at 100 MB.</summary>
     public const int MaxDetectionFileSize = 192 * 1024 * 1024;
     /// <summary>Default <see cref="LargeFileThreshold"/> (40 MB).</summary>
     public const int DefaultLargeFileThreshold = 40 * 1024 * 1024;
@@ -209,7 +232,7 @@ public sealed partial class EtchvClient : IDisposable
     /// <summary>Maximum response or result file size (256 MB).</summary>
     public const int MaxDownloadSize = 256 * 1024 * 1024;
     private const int MaxDetail = 10000;
-    private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull, Converters = { new AcceleratorJsonConverter() } };
+    private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull, Converters = { new WireJsonConverter<Accelerator>(ParseAccelerator, Wire), new WireJsonConverter<ActiveContent>(ParseActiveContent, Wire) } };
     private readonly HttpClient http;
     private readonly bool ownsHttp;
     private readonly string key;
@@ -240,6 +263,18 @@ public sealed partial class EtchvClient : IDisposable
     {
         "cpu" => Accelerator.Cpu,
         "gpu" => Accelerator.Gpu,
+        _ => null
+    };
+    internal static string Wire(ActiveContent activeContent) => activeContent switch
+    {
+        ActiveContent.Keep => "keep",
+        ActiveContent.RemoveAutoRun => "remove_auto_run",
+        _ => throw new ArgumentException("ActiveContent must be Keep or RemoveAutoRun")
+    };
+    internal static ActiveContent? ParseActiveContent(string? value) => value switch
+    {
+        "keep" => ActiveContent.Keep,
+        "remove_auto_run" => ActiveContent.RemoveAutoRun,
         _ => null
     };
 
@@ -277,9 +312,9 @@ public sealed partial class EtchvClient : IDisposable
 
     /// <summary>Submits a background embedding job and returns its receipt without waiting (<c>POST /watermarks/{media}/async</c>).</summary>
     /// <param name="media"><c>images</c>, <c>documents</c> or <c>videos</c>.</param>
-    /// <param name="file">File bytes (1 byte to 50 MB; PDFs and videos up to 20 MB).</param>
+    /// <param name="file">File bytes (1 byte to 50 MB for images and PDFs; DOCX, PPTX and videos up to 20 MB).</param>
     /// <param name="data">Non-empty JSON object of forensic data; its SHA-256 digest is embedded.</param>
-    /// <param name="options">Filename, idempotency key, optional storage destination and optional <see cref="RequestOptions.Accelerator"/>.</param>
+    /// <param name="options">Filename, idempotency key, optional storage destination, optional <see cref="RequestOptions.Accelerator"/> and, for documents, optional <see cref="RequestOptions.ActiveContent"/>.</param>
     /// <param name="webhookId">Optional enabled webhook endpoint (<c>wh_…</c>) to notify on completion.</param>
     /// <param name="cancellationToken">Cancels the request; server work continues.</param>
     /// <returns>The job receipt. Replays with the same idempotency key return the existing job.</returns>
@@ -291,7 +326,7 @@ public sealed partial class EtchvClient : IDisposable
 
     /// <summary>Submits a background detection job and returns its receipt without waiting (<c>POST /watermarks/{media}/detect/async</c>).</summary>
     /// <param name="media"><c>images</c>, <c>documents</c> or <c>videos</c>.</param>
-    /// <param name="file">File bytes (1 byte to 50 MB; PDFs and videos up to 20 MB).</param>
+    /// <param name="file">Delivered file bytes (images up to 192 MB, PDFs up to 95 MB; DOCX, PPTX and videos up to 100 MB).</param>
     /// <param name="options">Filename, idempotency key and optional <see cref="RequestOptions.Accelerator"/>. Storage options do not apply to detection.</param>
     /// <param name="webhookId">Optional enabled webhook endpoint (<c>wh_…</c>) to notify on completion.</param>
     /// <param name="cancellationToken">Cancels the request; server work continues.</param>
@@ -457,9 +492,12 @@ public sealed partial class EtchvClient : IDisposable
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedImageAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("images", file, data, options, cancellationToken);
     /// <summary>Watermarks a PDF, DOCX or PPTX and waits for the verified result, polling if processing continues.</summary>
-    /// <param name="file">PDF, DOCX or PPTX bytes (1 byte to 20 MB).</param>
+    /// <param name="file">
+    /// PDF bytes (1 byte to 50 MB, 1 to 2,000 pages; the watermarked copy must fit in 95 MB with 48 KB per page, so a
+    /// 2,000-page PDF can be up to about 1 MB), or DOCX or PPTX bytes (1 byte to 20 MB).
+    /// </param>
     /// <param name="data">Non-empty JSON object of forensic data.</param>
-    /// <param name="options">Filename, idempotency key, optional storage destination and optional <see cref="RequestOptions.Accelerator"/>.</param>
+    /// <param name="options">Filename, idempotency key, optional storage destination, optional <see cref="RequestOptions.Accelerator"/> and optional <see cref="RequestOptions.ActiveContent"/> (PDF only).</param>
     /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedDocumentAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("documents", file, data, options, cancellationToken);
@@ -471,19 +509,19 @@ public sealed partial class EtchvClient : IDisposable
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedVideoAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("videos", file, data, options, cancellationToken);
     /// <summary>Detects a watermark in an image synchronously.</summary>
-    /// <param name="file">Image bytes (1 byte to 50 MB).</param>
+    /// <param name="file">Delivered image bytes (1 byte to 192 MB; above 95 MB as a job).</param>
     /// <param name="options">Filename, optional idempotency key and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectImageAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("images", file, options, cancellationToken);
     /// <summary>Detects watermarks in a PDF (page by page), DOCX or PPTX synchronously.</summary>
-    /// <param name="file">PDF, DOCX or PPTX bytes (1 byte to 20 MB).</param>
+    /// <param name="file">Delivered PDF bytes (1 byte to 95 MB), or DOCX or PPTX bytes (1 byte to 100 MB; above 95 MB as a job).</param>
     /// <param name="options">Filename, optional idempotency key and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectDocumentAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("documents", file, options, cancellationToken);
     /// <summary>Detects watermarks in a video, frame by frame, waiting for the durable job to finish.</summary>
-    /// <param name="file">MP4, MOV, WebM, Matroska, MPEG or AVI bytes (1 byte to 20 MB).</param>
+    /// <param name="file">Delivered MP4, MOV, WebM, Matroska, MPEG or AVI bytes (1 byte to 100 MB).</param>
     /// <param name="options">Filename, optional idempotency key and optional <see cref="RequestOptions.Accelerator"/>.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
@@ -615,6 +653,11 @@ public sealed partial class EtchvClient : IDisposable
             if (options.StorageKey is not null) path += "&storage_key=" + Uri.EscapeDataString(options.StorageKey);
         }
         if (options.Accelerator is { } accelerator) path += (path.Contains('?') ? "&" : "?") + "accelerator=" + Wire(accelerator);
+        if (options.ActiveContent is { } activeContent)
+        {
+            if (data is null || !path.StartsWith("watermarks/documents", StringComparison.Ordinal)) throw new ArgumentException("ActiveContent applies to PDF documents only");
+            path += (path.Contains('?') ? "&" : "?") + "active_content=" + Wire(activeContent);
+        }
         if (options.IdempotencyKey is not null) Check(options.IdempotencyKey, "[A-Za-z0-9_-]{8,128}", "idempotency key (use 8–128 letters, digits, hyphens or underscores)");
         string? uploadId = null;
         if (file is not null && file.Length > largeFileThreshold)

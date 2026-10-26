@@ -6,7 +6,7 @@ Server-side .NET client for [Etchv](https://etchv.com): embed and detect invisib
 
 ```sh
 # From your project folder: clone next to it, not inside it
-git clone --branch v1.3.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
+git clone --branch v1.4.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
 dotnet add reference ../etchv-csharp-sdk/src/Etchv/Etchv.csproj
 ```
 
@@ -49,9 +49,10 @@ Detection uses `SubmitDetectionAsync`, `GetJobAsync(id, detect: true)` and `GetD
 
 ## Limits and large files
 
-Image uploads are limited to 50 MB; document and video uploads to 20 MB. Detection takes the files Etchv
-delivered: up to 192 MB for images, 64 MB for PDFs and 100 MB for DOCX, PPTX and
-video.
+Image and PDF uploads are limited to 50 MB; DOCX, PPTX and video uploads to 20 MB. A PDF has 1 to 2,000
+pages, and its watermarked copy must fit in 95 MB with 48 KB per page, so a 2,000-page PDF can be up to about
+1 MB. Detection takes the files Etchv delivered: up to 192 MB for images, 95 MB for PDFs and 100 MB for DOCX,
+PPTX and video.
 
 Files over 40 MB are uploaded once to a signed URL and then referenced by ID, so the request never
 carries the file. This is automatic in every embed, detect and submit method; retries reuse the same
@@ -109,7 +110,23 @@ var batch = await client.SubmitBatchZipAsync(await File.ReadAllBytesAsync("contr
     [new BatchZipItem("contracts/acme.pdf", new Dictionary<string, object?> { ["recipient"] = "acme" })]);
 ```
 
+`BatchOptions` takes `WebhookId`, `Accelerator`, `StorageDestinationId` and `ActiveContent` as for single files.
 Also: `GetBatchAsync`, `CancelBatchAsync` (files not yet running are refunded) and `ListBatchesAsync`.
+
+## PDF scripts and actions
+
+A watermarked PDF keeps its scripts, actions, form fields and attachments exactly as uploaded. Set
+`ActiveContent.RemoveAutoRun` on `RequestOptions` (for `EmbedDocumentAsync` or `SubmitEmbedAsync("documents", ...)`)
+or on `BatchOptions` to also remove what a PDF viewer runs by itself: the open action, document and page actions,
+document-level JavaScript and XFA forms. Links, form fields and attachments stay. `ActiveContent.RemoveAutoRun` is
+for PDFs only: the API refuses it for a DOCX or PPTX, and for a batch unless every file is a PDF. Keeping active
+content is accepted for any document and any batch.
+[Scripts and actions](https://etchv.com/docs/api/documents#scripts-and-actions).
+
+```csharp
+var result = await client.EmbedDocumentAsync(await File.ReadAllBytesAsync("contract.pdf"), data,
+    new RequestOptions(Filename: "contract.pdf") { ActiveContent = ActiveContent.RemoveAutoRun });
+```
 
 ## GPU processing
 
