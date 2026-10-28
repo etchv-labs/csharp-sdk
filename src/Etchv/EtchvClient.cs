@@ -161,7 +161,14 @@ public sealed record DetectionUnit(int Index, bool Watermarked, double Confidenc
 /// <param name="RequestId">The Etchv request ID.</param>
 /// <param name="Units">Per-frame, per-page or per-composite results.</param>
 /// <param name="Accelerator">Hardware that actually processed the file, or null when not reported.</param>
-public sealed record DetectionResult(bool Watermarked, double Confidence, string? WatermarkId, string? RequestId, IReadOnlyList<DetectionUnit> Units, Accelerator? Accelerator = null);
+public sealed record DetectionResult(bool Watermarked, double Confidence, string? WatermarkId, string? RequestId, IReadOnlyList<DetectionUnit> Units, Accelerator? Accelerator = null)
+{
+    /// <summary>The traceable link copy the watermark is on; null when it isn't on one, or the key lacks <c>links:read</c>.</summary>
+    /// <remarks>Init-only properties rather than positional parameters, so the 1.4.0 constructor and <c>Deconstruct</c> keep working.</remarks>
+    public DetectedCopy? Copy { get; init; }
+    /// <summary>Another of your watermarked assets the watermark is on; null when it isn't on one, or the key lacks <c>assets:read</c>.</summary>
+    public DetectedAsset? Asset { get; init; }
+}
 
 /// <summary>A durable watermarking or detection job receipt.</summary>
 /// <param name="RequestId">Job ID (<c>req_…</c>).</param>
@@ -215,7 +222,7 @@ public sealed record UploadSession(string UploadId, string Kind, string Filename
 public sealed partial class EtchvClient : IDisposable
 {
     /// <summary>SDK version.</summary>
-    public const string Version = "1.4.0";
+    public const string Version = "1.5.0";
     /// <summary>User-Agent sent with every request.</summary>
     public const string UserAgent = "etchv-csharp/" + Version;
     /// <summary>
@@ -232,7 +239,7 @@ public sealed partial class EtchvClient : IDisposable
     /// <summary>Maximum response or result file size (256 MB).</summary>
     public const int MaxDownloadSize = 256 * 1024 * 1024;
     private const int MaxDetail = 10000;
-    private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull, Converters = { new WireJsonConverter<Accelerator>(ParseAccelerator, Wire), new WireJsonConverter<ActiveContent>(ParseActiveContent, Wire) } };
+    private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull, Converters = { new WireJsonConverter<Accelerator>(ParseAccelerator, Wire), new WireJsonConverter<ActiveContent>(ParseActiveContent, Wire), new WireJsonConverter<LinkPrepare>(ParseLinkPrepare, Wire) } };
     private readonly HttpClient http;
     private readonly bool ownsHttp;
     private readonly string key;
@@ -770,7 +777,10 @@ public sealed partial class EtchvClient : IDisposable
             else units.Add(top);
             var accelerator = ParseAccelerator(r.Accelerator)
                 ?? (v.TryGetProperty("accelerator", out var reported) && reported.ValueKind == JsonValueKind.String ? ParseAccelerator(reported.GetString()) : null);
-            return new(top.Watermarked, top.Confidence, top.WatermarkId, r.RequestId, units.AsReadOnly(), accelerator);
+            T? Named<T>(string name) where T : class =>
+                v.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Object ? value.Deserialize<T>(Json) : null;
+            return new(top.Watermarked, top.Confidence, top.WatermarkId, r.RequestId, units.AsReadOnly(), accelerator)
+            { Copy = Named<DetectedCopy>("copy"), Asset = Named<DetectedAsset>("asset") };
         }
         catch (Exception e) when (e is JsonException or FormatException or InvalidOperationException or KeyNotFoundException or OverflowException)
         { throw new EtchvException(200, "Invalid detection response", r.RequestId); }

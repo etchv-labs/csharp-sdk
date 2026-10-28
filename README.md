@@ -6,7 +6,7 @@ Server-side .NET client for [Etchv](https://etchv.com): embed and detect invisib
 
 ```sh
 # From your project folder: clone next to it, not inside it
-git clone --branch v1.4.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
+git clone --branch v1.5.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
 dotnet add reference ../etchv-csharp-sdk/src/Etchv/Etchv.csproj
 ```
 
@@ -113,6 +113,33 @@ var batch = await client.SubmitBatchZipAsync(await File.ReadAllBytesAsync("contr
 `BatchOptions` takes `WebhookId`, `Accelerator`, `StorageDestinationId` and `ActiveContent` as for single files.
 Also: `GetBatchAsync`, `CancelBatchAsync` (files not yet running are refunded) and `ListBatchesAsync`.
 
+## Traceable links
+
+Share one file so each recipient downloads their own watermarked copy. Use the
+source asset of a file you've watermarked; send the returned `Url` yourself.
+
+```csharp
+var link = await client.CreateLinkAsync(new LinkRequest(result.SourceAssetId!, "Board pack, October",
+    Recipients: ["alex@example.com", "sam@example.com"], DownloadLimit: 3));
+Console.WriteLine(link.Url);
+```
+
+Give `AllowedDomains: ["example.com"]` instead of `Recipients` to let anyone at
+those domains open it. `ExpiresAt` (a `DateTimeOffset`), `Prepare`
+(`LinkPrepare.OnOpen` or `LinkPrepare.OnCreate`) and `WebhookId` are optional.
+Retries reuse one `Idempotency-Key` (pass your own as the second argument), so a
+retry returns the same link. Without the credits for the copies, the call throws
+`EtchvException` with HTTP 402 and `Code` `insufficient_credits`.
+`EstimateLinkAsync` takes the same request and reports the credits the copies
+would take without creating anything. Also `GetLinkAsync` (each recipient, their
+opens and their copy), `ListLinksAsync`, `ListLinkEventsAsync` and
+`RevokeLinkAsync`.
+
+When a detected file is one of your links' copies, `DetectionResult.Copy` names
+the link, the recipient and when they first opened it (needs `links:read`);
+`DetectionResult.Asset` names any other watermarked asset of yours (needs
+`assets:read`). See https://etchv.com/docs/api/links.
+
 ## PDF scripts and actions
 
 A watermarked PDF keeps its scripts, actions, form fields and attachments exactly as uploaded. Set
@@ -146,12 +173,13 @@ include `AcceleratorRequested` and `Accelerator`. Omit the option for CPU (the d
 
 Durable operations (embedding, video detection, job results) retry network errors and HTTP 429, 502, 503 and 504
 with the same idempotency key, waiting for `Retry-After` (up to 5 seconds per wait) when the API sends it, until the
-client timeout. Batch calls do the same, except that creating a batch does not retry HTTP 503 (batch uploads
-unavailable; send a zip instead).
+client timeout. Batch calls and `CreateLinkAsync` do the same, except that creating a batch does not retry HTTP 503
+(batch uploads unavailable; send a zip instead).
 
 ## Also included
 
 - API key check: `GetApiKeyInfoAsync`
+- Traceable links: `CreateLinkAsync`, `EstimateLinkAsync`, `ListLinksAsync`, `GetLinkAsync`, `ListLinkEventsAsync`, `RevokeLinkAsync`
 - Batches: `SubmitBatchAsync`, `SubmitBatchZipAsync`, `GetBatchAsync`, `WaitForBatchAsync`, `IterBatchResultsAsync`, `DownloadBatchArchiveAsync`, `CancelBatchAsync`, `ListBatchesAsync`
 - Assets: `ListAssetsAsync`, `GetAssetAsync`, `UpdateAssetAsync`, `DeleteAssetAsync`, `DeleteAssetsAsync`, `DownloadAssetAsync`
 - Webhooks: `ListWebhooksAsync`, `CreateWebhookAsync`, `UpdateWebhookAsync`, `DeleteWebhookAsync`, `ListWebhookDeliveriesAsync`, `RedeliverWebhookAsync`, and `WebhookSignature.Verify`
