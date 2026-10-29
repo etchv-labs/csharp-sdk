@@ -6,7 +6,7 @@ Server-side .NET client for [Etchv](https://etchv.com): embed and detect invisib
 
 ```sh
 # From your project folder: clone next to it, not inside it
-git clone --branch v1.5.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
+git clone --branch v1.6.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
 dotnet add reference ../etchv-csharp-sdk/src/Etchv/Etchv.csproj
 ```
 
@@ -135,6 +135,13 @@ would take without creating anything. Also `GetLinkAsync` (each recipient, their
 opens and their copy), `ListLinksAsync`, `ListLinkEventsAsync` and
 `RevokeLinkAsync`.
 
+`DeleteLinkAsync(id)` deletes a link with every recipient's opens, downloads and
+copy; `RemoveLinkRecipientAsync(id, recipientId)` does the same for one
+recipient (their `Id` in `GetLinkAsync`) and returns the link without them.
+Neither can be undone, and detection no longer names a deleted recipient. Both
+need an owner or admin and, for an API key, `assets:delete` as well as
+`links:write`.
+
 When a detected file is one of your links' copies, `DetectionResult.Copy` names
 the link, the recipient and when they first opened it (needs `links:read`);
 `DetectionResult.Asset` names any other watermarked asset of yours (needs
@@ -179,7 +186,7 @@ client timeout. Batch calls and `CreateLinkAsync` do the same, except that creat
 ## Also included
 
 - API key check: `GetApiKeyInfoAsync`
-- Traceable links: `CreateLinkAsync`, `EstimateLinkAsync`, `ListLinksAsync`, `GetLinkAsync`, `ListLinkEventsAsync`, `RevokeLinkAsync`
+- Traceable links: `CreateLinkAsync`, `EstimateLinkAsync`, `ListLinksAsync`, `GetLinkAsync`, `ListLinkEventsAsync`, `RevokeLinkAsync`, `DeleteLinkAsync`, `RemoveLinkRecipientAsync`
 - Batches: `SubmitBatchAsync`, `SubmitBatchZipAsync`, `GetBatchAsync`, `WaitForBatchAsync`, `IterBatchResultsAsync`, `DownloadBatchArchiveAsync`, `CancelBatchAsync`, `ListBatchesAsync`
 - Assets: `ListAssetsAsync`, `GetAssetAsync`, `UpdateAssetAsync`, `DeleteAssetAsync`, `DeleteAssetsAsync`, `DownloadAssetAsync`
 - Webhooks: `ListWebhooksAsync`, `CreateWebhookAsync`, `UpdateWebhookAsync`, `DeleteWebhookAsync`, `ListWebhookDeliveriesAsync`, `RedeliverWebhookAsync`, and `WebhookSignature.Verify`

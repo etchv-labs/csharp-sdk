@@ -222,7 +222,7 @@ public sealed record UploadSession(string UploadId, string Kind, string Filename
 public sealed partial class EtchvClient : IDisposable
 {
     /// <summary>SDK version.</summary>
-    public const string Version = "1.5.0";
+    public const string Version = "1.6.0";
     /// <summary>User-Agent sent with every request.</summary>
     public const string UserAgent = "etchv-csharp/" + Version;
     /// <summary>

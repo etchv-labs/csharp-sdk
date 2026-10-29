@@ -9,7 +9,7 @@ public sealed class LinksTests
 {
     private const string Base = "https://api.etchv.com";
     private static readonly string Asset = "ast_" + new string('e', 64), Lnk = "lnk_" + new string('a', 32), Lev = "lev_" + new string('b', 32),
-        Hook = "wh_" + new string('c', 32), Wid = string.Concat(Enumerable.Repeat("ab", 32)), Job = "req_" + new string('f', 64);
+        Hook = "wh_" + new string('c', 32), Lrc = "lrc_" + new string('d', 32), Wid = string.Concat(Enumerable.Repeat("ab", 32)), Job = "req_" + new string('f', 64);
     private static readonly byte[] Png = [137, 80, 78, 71, 13, 10, 26, 10, .. new byte[32]];
 
     private static JsonObject LinkJson(string status = "active", JsonArray? recipients = null)
@@ -118,6 +118,10 @@ public sealed class LinksTests
         await Assert.ThrowsAsync<ArgumentException>(() => client.CreateLinkAsync(Board, "has space in it"));
         await Assert.ThrowsAsync<ArgumentException>(() => client.GetLinkAsync("lnk_1"));
         await Assert.ThrowsAsync<ArgumentException>(() => client.RevokeLinkAsync("../links"));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.DeleteLinkAsync("lnk_1"));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.RemoveLinkRecipientAsync(Lnk, "lrc_1"));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.RemoveLinkRecipientAsync(Lnk, Lnk));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.RemoveLinkRecipientAsync("lnk_1", Lrc));
         await Assert.ThrowsAsync<ArgumentException>(() => client.ListLinksAsync(limit: 0));
         await Assert.ThrowsAsync<ArgumentException>(() => client.ListLinksAsync(limit: 51));
         await Assert.ThrowsAsync<ArgumentException>(() => client.ListLinksAsync(before: "bat_" + new string('a', 32)));
@@ -160,7 +164,7 @@ public sealed class LinksTests
             if (path == "/links") return Json(HttpStatusCode.OK, new JsonObject { ["data"] = new JsonArray(LinkJson()), ["next_cursor"] = Lnk });
             var recipients = new JsonArray(new JsonObject
             {
-                ["email"] = "alex@example.com", ["status"] = "opened", ["opened_at"] = "2026-10-27T00:00:00Z", ["last_opened_at"] = "2026-10-27T01:00:00Z",
+                ["id"] = Lrc, ["email"] = "alex@example.com", ["status"] = "opened", ["opened_at"] = "2026-10-27T00:00:00Z", ["last_opened_at"] = "2026-10-27T01:00:00Z",
                 ["open_count"] = 2, ["download_count"] = 1, ["copy"] = new JsonObject { ["status"] = "ready", ["asset_id"] = Asset, ["error_code"] = null },
             });
             return Json(HttpStatusCode.OK, LinkJson(request.Method == HttpMethod.Post ? "revoked" : "active", recipients));
@@ -172,7 +176,7 @@ public sealed class LinksTests
         Assert.Equal(Lnk, page.NextCursor); Assert.Empty(page.Data[0].Recipients); Assert.Empty(page.Data[0].AllowedDomains);
         var link = await client.GetLinkAsync(Lnk);
         Assert.Equal("active", link.Status); Assert.Equal("ready", link.Recipients[0].Copy.Status); Assert.Equal(Asset, link.Recipients[0].Copy.AssetId);
-        Assert.Equal(2, link.Recipients[0].OpenCount);
+        Assert.Equal(2, link.Recipients[0].OpenCount); Assert.Equal(Lrc, link.Recipients[0].Id);
         var events = await client.ListLinkEventsAsync(Lnk, before: Lev);
         Assert.Equal("downloaded", events.Data[0].Type); Assert.Equal(Asset, events.Data[0].AssetId); Assert.Null(events.NextCursor);
         await client.ListLinkEventsAsync(Lnk, 100);
@@ -186,6 +190,38 @@ public sealed class LinksTests
         Assert.True(JsonNode.DeepEquals(JsonNode.Parse(handler.Requests[0].Body),
             new JsonObject { ["asset_id"] = Asset, ["name"] = "Board pack", ["allowed_domains"] = new JsonArray("example.com") }));
         Assert.All(handler.Requests, r => Assert.True(r.ApiKey));
+    }
+
+    [Fact]
+    public async Task DeleteALinkOrRemoveOneRecipient()
+    {
+        var handler = new RecordingHandler((request, _) => request.RequestUri!.AbsolutePath.Contains("/recipients/")
+            ? Json(HttpStatusCode.OK, LinkJson(recipients: new JsonArray()))
+            : new HttpResponseMessage(HttpStatusCode.NoContent));
+        using var client = Client(handler);
+        await client.DeleteLinkAsync(Lnk);
+        Assert.Empty((await client.RemoveLinkRecipientAsync(Lnk, Lrc)).Recipients);
+        Assert.Equal(["DELETE /links/" + Lnk, "DELETE /links/" + Lnk + "/recipients/" + Lrc], handler.Requests.Select(r => $"{r.Method} {r.Uri.PathAndQuery}"));
+    }
+
+    [Fact]
+    public async Task DeletesSurfaceRefusals()
+    {
+        var notFound = new RecordingHandler((_, _) => Json(HttpStatusCode.NotFound, new JsonObject { ["detail"] = "Recipient not found" }));
+        using (var client = Client(notFound))
+            Assert.Equal(404, (await Assert.ThrowsAsync<EtchvException>(() => client.RemoveLinkRecipientAsync(Lnk, Lrc))).StatusCode);
+        var forbidden = new RecordingHandler((_, _) => Json(HttpStatusCode.Forbidden, new JsonObject { ["detail"] = "needs assets:delete" }));
+        using (var client = Client(forbidden))
+            Assert.Equal(403, (await Assert.ThrowsAsync<EtchvException>(() => client.DeleteLinkAsync(Lnk))).StatusCode);
+    }
+
+    [Fact]
+    public void ARecipientKeepsItsPositionalConstructor()
+    {
+        // The 1.5.0 positional constructor and Deconstruct still work; Id is set on init.
+        var recipient = new LinkRecipient("alex@example.com", "opened", null, null, 1, 0, new LinkCopy("ready", Asset, null)) { Id = Lrc };
+        var (email, _, _, _, opens, _, _) = recipient;
+        Assert.Equal(("alex@example.com", 1, Lrc), (email, opens, recipient.Id));
     }
 
     [Fact]

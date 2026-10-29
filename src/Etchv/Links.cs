@@ -47,7 +47,12 @@ public sealed record LinkCopy(string Status, string? AssetId, string? ErrorCode)
 /// <param name="OpenCount">Opens so far.</param>
 /// <param name="DownloadCount">Downloads so far.</param>
 /// <param name="Copy">The recipient's watermarked copy.</param>
-public sealed record LinkRecipient(string Email, string Status, string? OpenedAt, string? LastOpenedAt, int OpenCount, int DownloadCount, LinkCopy Copy);
+public sealed record LinkRecipient(string Email, string Status, string? OpenedAt, string? LastOpenedAt, int OpenCount, int DownloadCount, LinkCopy Copy)
+{
+    /// <summary>Recipient ID (<c>lrc_…</c>), which <see cref="EtchvClient.RemoveLinkRecipientAsync"/> takes.</summary>
+    /// <remarks>An init-only property rather than a positional parameter, so the 1.5.0 constructor and <c>Deconstruct</c> keep working.</remarks>
+    public string Id { get; init; } = "";
+}
 
 /// <summary>A traceable link. Timestamps are ISO 8601 strings.</summary>
 /// <param name="Id">Link ID (<c>lnk_…</c>).</param>
@@ -217,6 +222,31 @@ public sealed partial class EtchvClient
     /// <returns>The revoked link.</returns>
     public Task<Link> RevokeLinkAsync(string linkId, CancellationToken cancellationToken = default) =>
         JsonAsync<Link>(HttpMethod.Post, LinkPath(linkId) + "/revoke", null, cancellationToken);
+
+    /// <summary>
+    /// Deletes a link with every recipient's opens, downloads and copy (<c>DELETE /links/{id}</c>, <c>links:write</c> and <c>assets:delete</c>,
+    /// owner or admin). The link stops at once, as on a revoke. This can't be undone, and detection no longer names the link's recipients.
+    /// Deleting again also succeeds.
+    /// </summary>
+    /// <param name="linkId">Link ID (<c>lnk_…</c>).</param>
+    /// <param name="cancellationToken">Cancels the request.</param>
+    public async Task DeleteLinkAsync(string linkId, CancellationToken cancellationToken = default) =>
+        await ManageAsync(HttpMethod.Delete, LinkPath(linkId), null, cancellationToken).ConfigureAwait(false);
+
+    /// <summary>
+    /// Deletes one recipient's opens, downloads and copy, for example when they ask to be erased
+    /// (<c>DELETE /links/{id}/recipients/{recipient_id}</c>, <c>links:write</c> and <c>assets:delete</c>, owner or admin).
+    /// This can't be undone, and detection no longer names the recipient.
+    /// </summary>
+    /// <param name="linkId">Link ID (<c>lnk_…</c>).</param>
+    /// <param name="recipientId">The recipient's <see cref="LinkRecipient.Id"/> (<c>lrc_…</c>).</param>
+    /// <param name="cancellationToken">Cancels the request.</param>
+    /// <returns>The link without the recipient.</returns>
+    public Task<Link> RemoveLinkRecipientAsync(string linkId, string recipientId, CancellationToken cancellationToken = default)
+    {
+        var path = LinkPath(linkId) + "/recipients/" + Check(recipientId, "lrc_[a-f0-9]{32}", "recipient ID");
+        return JsonAsync<Link>(HttpMethod.Delete, path, null, cancellationToken);
+    }
 
     private static string PageQuery(int? limit, int most, string? before, string prefix, string label)
     {
