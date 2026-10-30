@@ -167,9 +167,12 @@ public sealed partial class EtchvClient
     /// <returns>The requeued delivery.</returns>
     public Task<StorageDelivery> RetryStorageDeliveryAsync(string id, CancellationToken cancellationToken = default) => JsonAsync<StorageDelivery>(HttpMethod.Post, DeliveryPath(id) + "/retry", null, cancellationToken);
 
-    /// <summary>Downloads a stored object through Etchv (<c>GET /storage/deliveries/{id}/content</c>). Requires a <c>stored</c> delivery.</summary>
+    /// <summary>
+    /// Downloads a stored object through Etchv (<c>GET /storage/deliveries/{id}/content</c>). Requires a <c>stored</c> delivery.
+    /// A network error is retried within the client timeout.
+    /// </summary>
     /// <param name="id">Delivery ID (<c>std_…</c>).</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The file bytes.</returns>
-    public async Task<byte[]> DownloadStorageDeliveryAsync(string id, CancellationToken cancellationToken = default) => (await ManageAsync(HttpMethod.Get, DeliveryPath(id) + "/content", null, cancellationToken).ConfigureAwait(false)).Bytes;
+    public async Task<byte[]> DownloadStorageDeliveryAsync(string id, CancellationToken cancellationToken = default) => (await RequestAsync(DeliveryPath(id) + "/content", null, null, new(), false, false, cancellationToken, resend: true).ConfigureAwait(false)).Bytes;
 }

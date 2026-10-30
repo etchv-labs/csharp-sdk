@@ -116,7 +116,7 @@ public sealed class AcceleratorTests
         var error = await Assert.ThrowsAsync<EtchvException>(() => bounded.EmbedImageAsync(Png, Data));
         Assert.Equal(0, error.StatusCode);
 
-        // Synchronous image detection is not retried; 429 surfaces immediately with its details.
+        // Synchronous image detection retries only a dropped connection; 429 surfaces immediately with its details.
         var single = new QueueHandler(() => Limited("7"), () => Limited("12"));
         using var once = new EtchvClient("test-key", Base, httpClient: new HttpClient(single));
         var limited = await Assert.ThrowsAsync<EtchvException>(() => once.DetectImageAsync(Png));

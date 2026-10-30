@@ -6,7 +6,7 @@ Server-side .NET client for [Etchv](https://etchv.com): embed and detect invisib
 
 ```sh
 # From your project folder: clone next to it, not inside it
-git clone --branch v1.6.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
+git clone --branch v1.7.0 https://github.com/etchv-labs/csharp-sdk.git ../etchv-csharp-sdk
 dotnet add reference ../etchv-csharp-sdk/src/Etchv/Etchv.csproj
 ```
 
@@ -101,7 +101,9 @@ an expired batch's idempotency key raises HTTP 410 with `Code` `batch_expired`, 
 wait as long as the API's `Retry-After` asks (at least 1 second) between polls. The archive download fails with status 0 and an inner
 `TimeoutException` when the archive is not ready in time or when the download stalls; it raises HTTP 409 with `Code`
 `batch_not_started`, `archive_not_requested`, `archive_too_large` or `archive_unavailable`, and HTTP 410 once expired.
-`DownloadBatchArchiveAsync(id)` without a stream returns the bytes.
+`DownloadBatchArchiveAsync(id)` without a stream returns the bytes. If the connection drops or stalls mid-download
+within the wait timeout, a seekable stream is cut back to where the download began and the zip is downloaded again
+from the beginning; a stream that cannot seek fails with status 0 instead.
 
 Files already together in a zip (up to 55 MB) go in one request with a manifest naming every member:
 
@@ -182,6 +184,22 @@ Durable operations (embedding, video detection, job results) retry network error
 with the same idempotency key, waiting for `Retry-After` (up to 5 seconds per wait) when the API sends it, until the
 client timeout. Batch calls and `CreateLinkAsync` do the same, except that creating a batch does not retry HTTP 503
 (batch uploads unavailable; send a zip instead).
+
+These calls also retry a dropped connection within the client timeout: embedding, `DetectVideoAsync`,
+`SubmitEmbedAsync`, `SubmitDetectionAsync`, `GetEmbedResultAsync`, `GetDetectionResultAsync`, `SubmitBatchAsync`,
+`SubmitBatchZipAsync`, `GetBatchAsync`, `WaitForBatchAsync`, `IterBatchResultsAsync`, `CancelBatchAsync`,
+`ListBatchesAsync`, `CreateLinkAsync`, `DetectImageAsync`, `DetectDocumentAsync`, `DownloadAssetAsync`,
+`DownloadStorageDeliveryAsync` and `DownloadBatchArchiveAsync`. Other calls throw `EtchvException` with status 0
+("Network error").
+
+`DetectImageAsync` and `DetectDocumentAsync` resend with the same idempotency key (generated when omitted), and the API
+returns the first result without charging again. A retry the API reports as still running (HTTP 409
+`request_in_progress`, or `upload_in_use` for a file sent through an upload) waits and is sent again; HTTP 409
+`replay_expired` or `request_failed` throws. The API keeps the result 24 hours for this; set `KeepResult = false` on
+`RequestOptions` to keep nothing, and a retry then runs detection again at no charge, after the SDK uploads the file
+again if it went through an upload. The detection requests, resends included, stay within one client timeout
+counted from the first send; uploading the file again is bounded like any upload. Exceptions from a keyed call carry its `IdempotencyKey`, so you can resend it yourself. A batch
+archive starts again from the beginning.
 
 ## Also included
 

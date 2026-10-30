@@ -96,10 +96,10 @@ public sealed partial class EtchvClient
         await ManageAsync(HttpMethod.Post, "assets/bulk-delete", Body(new { asset_ids = ids }), cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>Downloads an asset file (<c>GET /assets/{id}/content</c>). Requires <c>assets:read</c>.</summary>
+    /// <summary>Downloads an asset file (<c>GET /assets/{id}/content</c>). Requires <c>assets:read</c>. A network error is retried within the client timeout.</summary>
     /// <param name="id">Asset ID (<c>ast_…</c>).</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The file bytes in the original format.</returns>
     /// <exception cref="EtchvException">HTTP 410 when the file availability window ended.</exception>
-    public async Task<byte[]> DownloadAssetAsync(string id, CancellationToken cancellationToken = default) => (await ManageAsync(HttpMethod.Get, AssetPath(id) + "/content", null, cancellationToken).ConfigureAwait(false)).Bytes;
+    public async Task<byte[]> DownloadAssetAsync(string id, CancellationToken cancellationToken = default) => (await RequestAsync(AssetPath(id) + "/content", null, null, new(), false, false, cancellationToken, resend: true).ConfigureAwait(false)).Bytes;
 }

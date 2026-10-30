@@ -128,6 +128,14 @@ public sealed record RequestOptions(string? Filename = null, string? Idempotency
     /// omitted by default (<see cref="Etchv.ActiveContent.Keep"/>). Other media and detection throw <see cref="ArgumentException"/>.
     /// </summary>
     public ActiveContent? ActiveContent { get; init; }
+    /// <summary>
+    /// Image and document detection answered in the request: whether the API keeps the result 24 hours so a retry with the
+    /// same idempotency key gets it back (omitted by default, which keeps it). With <c>false</c> nothing is kept, and a
+    /// retry runs detection again on the resent file at no charge. Detection that runs as a job keeps its result like
+    /// any job; other calls throw <see cref="ArgumentException"/>.
+    /// </summary>
+    /// <remarks>An init-only property rather than a positional parameter, so the 1.6.0 constructor and <c>Deconstruct</c> keep working.</remarks>
+    public bool? KeepResult { get; init; }
 }
 
 /// <summary>A verified watermarked file.</summary>
@@ -222,7 +230,7 @@ public sealed record UploadSession(string UploadId, string Kind, string Filename
 public sealed partial class EtchvClient : IDisposable
 {
     /// <summary>SDK version.</summary>
-    public const string Version = "1.6.0";
+    public const string Version = "1.7.0";
     /// <summary>User-Agent sent with every request.</summary>
     public const string UserAgent = "etchv-csharp/" + Version;
     /// <summary>
@@ -515,15 +523,25 @@ public sealed partial class EtchvClient : IDisposable
     /// <param name="cancellationToken">Cancels waiting; server work continues.</param>
     /// <returns>The verified watermarked file.</returns>
     public Task<EmbedResult> EmbedVideoAsync(byte[] file, IReadOnlyDictionary<string, object?> data, RequestOptions? options = null, CancellationToken cancellationToken = default) => EmbedAsync("videos", file, data, options, cancellationToken);
-    /// <summary>Detects a watermark in an image synchronously.</summary>
+    /// <summary>
+    /// Detects a watermark in an image synchronously. A dropped connection is retried with the same idempotency key
+    /// (generated when omitted) until the client timeout, and so is a retry the API reports as still running (HTTP 409
+    /// <c>request_in_progress</c>, or <c>upload_in_use</c> while the first copy holds the file's upload; after its
+    /// <c>Retry-After</c>, up to 5 seconds). The API returns the first result without charging again. Other errors are
+    /// not retried: HTTP 409 <c>replay_expired</c> or <c>request_failed</c> throws with that
+    /// <see cref="EtchvException.Code"/>. Every <see cref="EtchvException"/> it throws, including the status 0 one when
+    /// time runs out, carries the key in <see cref="EtchvException.IdempotencyKey"/>. With
+    /// <see cref="RequestOptions.KeepResult"/> false, a file that went through an upload is uploaded again for a re-run,
+    /// bounded like any upload; the resend after it stays within the client timeout counted from the first send.
+    /// </summary>
     /// <param name="file">Delivered image bytes (1 byte to 192 MB; above 95 MB as a job).</param>
-    /// <param name="options">Filename, optional idempotency key and optional <see cref="RequestOptions.Accelerator"/>.</param>
+    /// <param name="options">Filename, optional idempotency key, optional <see cref="RequestOptions.Accelerator"/> and optional <see cref="RequestOptions.KeepResult"/>.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectImageAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("images", file, options, cancellationToken);
-    /// <summary>Detects watermarks in a PDF (page by page), DOCX or PPTX synchronously.</summary>
+    /// <summary>Detects watermarks in a PDF (page by page), DOCX or PPTX synchronously, retried like <see cref="DetectImageAsync"/>.</summary>
     /// <param name="file">Delivered PDF bytes (1 byte to 95 MB), or DOCX or PPTX bytes (1 byte to 100 MB; above 95 MB as a job).</param>
-    /// <param name="options">Filename, optional idempotency key and optional <see cref="RequestOptions.Accelerator"/>.</param>
+    /// <param name="options">Filename, optional idempotency key, optional <see cref="RequestOptions.Accelerator"/> and optional <see cref="RequestOptions.KeepResult"/>.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The detection result.</returns>
     public Task<DetectionResult> DetectDocumentAsync(byte[] file, RequestOptions? options = null, CancellationToken cancellationToken = default) => DetectAsync("documents", file, options, cancellationToken);
@@ -567,13 +585,14 @@ public sealed partial class EtchvClient : IDisposable
     {
         if (media != "videos" && file is { Length: > MaxSyncDetectionFileSize })
         {
-            // Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job.
-            var receipt = await SubmitDetectionAsync(media, file, options, null, ct).ConfigureAwait(false);
+            // Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job, which keeps its result.
+            var receipt = await SubmitDetectionAsync(media, file, options is null ? null : options with { KeepResult = null }, null, ct).ConfigureAwait(false);
             return await GetDetectionResultAsync(receipt.RequestId, ct).ConfigureAwait(false);
         }
+        // Videos run as a durable job; images and documents answer in the request, and the API replays that answer for the same key.
         bool durable = media == "videos";
-        options = Prepare(media, file, options, durable, detect: true);
-        return Detection(await RequestAsync($"watermarks/{media}/detect", file, null, options, durable, durable, ct).ConfigureAwait(false));
+        options = Prepare(media, file, options, true, detect: true);
+        return Detection(await RequestAsync($"watermarks/{media}/detect", file, null, options, durable, durable, ct, resend: !durable).ConfigureAwait(false));
     }
 
     private static RequestOptions Prepare(string media, byte[] file, RequestOptions? options, bool durable, bool detect = false)
@@ -649,7 +668,13 @@ public sealed partial class EtchvClient : IDisposable
         catch (JsonException) { throw new EtchvException(status, "Invalid JSON response", requestId); }
     }
 
-    private async Task<Reply> RequestAsync(string path, byte[]? file, string? data, RequestOptions options, bool durable, bool detectionJob, CancellationToken caller)
+    /// <summary>
+    /// Sends an embed, detect, job or download request. <paramref name="durable"/> retries network errors and HTTP 429 and
+    /// 5xx and polls a 202 job. <paramref name="resend"/> is for a request the API answers the same way twice (a GET
+    /// download, or an instant detection with its idempotency key): it is sent again after a network error and while the
+    /// API reports the first copy still running, but no error status is retried.
+    /// </summary>
+    private async Task<Reply> RequestAsync(string path, byte[]? file, string? data, RequestOptions options, bool durable, bool detectionJob, CancellationToken caller, bool resend = false)
     {
         if (options.StorageKey is not null && options.StorageDestinationId is null) throw new ArgumentException("Storage key requires a storage destination ID");
         if (options.StorageDestinationId is not null)
@@ -665,19 +690,38 @@ public sealed partial class EtchvClient : IDisposable
             if (data is null || !path.StartsWith("watermarks/documents", StringComparison.Ordinal)) throw new ArgumentException("ActiveContent applies to PDF documents only");
             path += (path.Contains('?') ? "&" : "?") + "active_content=" + Wire(activeContent);
         }
+        if (options.KeepResult is { } keep)
+        {
+            if (path.Split('?')[0] is not ("watermarks/images/detect" or "watermarks/documents/detect"))
+                throw new ArgumentException("KeepResult applies to image and document detection only");
+            path += (path.Contains('?') ? "&" : "?") + "keep_result=" + (keep ? "true" : "false");
+        }
         if (options.IdempotencyKey is not null) Check(options.IdempotencyKey, "[A-Za-z0-9_-]{8,128}", "idempotency key (use 8–128 letters, digits, hyphens or underscores)");
-        string? uploadId = null;
+        string? uploadId = null, kind = null;
+        bool reuploaded = false;
+        // Upload failures carry the key too, so a caller can resend a detection whose re-upload failed.
+        async Task<string> Upload(byte[] bytes)
+        {
+            try { return (await UploadAsync(kind!, bytes, options.Filename ?? "file", caller).ConfigureAwait(false)).UploadId; }
+            catch (EtchvException e) when (e.IdempotencyKey is null && options.IdempotencyKey is not null)
+            {
+                throw new EtchvException(e.StatusCode, e.Detail, e.RequestId, options.IdempotencyKey, e.InnerException) { RetryAfter = e.RetryAfter };
+            }
+        }
         if (file is not null && file.Length > largeFileThreshold)
         {
             // Too large for one request body: upload once (bounded by stalls, not the client timeout); every retry
             // sends the same upload_id.
             var route = path.Split('?')[0];
-            string kind = route.Contains("/detect", StringComparison.Ordinal) ? "detect"
+            kind = route.Contains("/detect", StringComparison.Ordinal) ? "detect"
                 : route.Split('/')[1] switch { "documents" => "document", "videos" => "video", _ => "image" };
-            uploadId = (await UploadAsync(kind, file, options.Filename ?? "file", caller).ConfigureAwait(false)).UploadId;
+            uploadId = await Upload(file).ConfigureAwait(false);
         }
+        // The deadline starts with the first request, after the first upload, and also bounds a resend after a re-upload.
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(caller);
         deadline.CancelAfter(timeout); var ct = deadline.Token; string? requestId = null;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        Exception? dropped = null;
         try
         {
             while (true)
@@ -694,6 +738,7 @@ public sealed partial class EtchvClient : IDisposable
                 try
                 {
                     var r = await SendAsync(file is null ? HttpMethod.Get : HttpMethod.Post, path, form, options.IdempotencyKey, ct).ConfigureAwait(false);
+                    dropped = null;
                     requestId = r.RequestId ?? requestId;
                     r = r with { RequestId = requestId };
                     if (r.Status == 200 || (r.Status == 202 && path.Split('?')[0].EndsWith("/async", StringComparison.Ordinal))) return r;
@@ -709,19 +754,41 @@ public sealed partial class EtchvClient : IDisposable
                         double seconds = double.TryParse(r.RetryAfter, NumberStyles.Float, CultureInfo.InvariantCulture, out var delay) && double.IsFinite(delay) ? Math.Clamp(delay, .01, 5) : 1;
                         await Task.Delay(TimeSpan.FromSeconds(seconds), ct).ConfigureAwait(false); continue;
                     }
+                    string? code = detail.ValueKind == JsonValueKind.Object && detail.TryGetProperty("detail", out var inner) && inner.ValueKind == JsonValueKind.Object
+                        && inner.TryGetProperty("code", out var named) && named.ValueKind == JsonValueKind.String ? named.GetString() : null;
+                    // The first copy is still running, or (with an upload this call made) still holds the upload: wait and resend.
+                    if (resend && r.Status == 409 && (code == "request_in_progress" || (code == "upload_in_use" && uploadId is not null)))
+                    {
+                        await Task.Delay(RetryDelay(r.RetryAfter), ct).ConfigureAwait(false); continue;
+                    }
+                    if (resend && r.Status == 409 && code == "upload_consumed" && kind is not null && !reuploaded)
+                    {
+                        // A dropped detection consumed the upload and kept no result (KeepResult = false): the API runs it
+                        // again on the same bytes, so upload them again and resend with the same key.
+                        uploadId = await Upload(file!).ConfigureAwait(false);
+                        reuploaded = true; continue;
+                    }
                     bool failed = detail.ValueKind == JsonValueKind.Object && detail.TryGetProperty("status", out var state) && state.ValueKind == JsonValueKind.String && state.GetString() == "failed";
                     if (durable && r.Status is 429 or 502 or 503 or 504 && !failed) { await Task.Delay(RetryDelay(r.RetryAfter), ct).ConfigureAwait(false); continue; }
                     throw new EtchvException(r.Status, Truncate(r.Bytes), requestId, options.IdempotencyKey) { RetryAfter = ParseRetryAfter(r.RetryAfter) };
                 }
                 catch (Exception e) when (e is HttpRequestException or IOException)
                 {
-                    if (!durable) throw new EtchvException(0, "Network error", requestId, options.IdempotencyKey, e);
+                    // A download out of time throws the network error; a keyed request ends with the deadline and its key.
+                    if (!durable && (!resend || (options.IdempotencyKey is null && clock.Elapsed + TimeSpan.FromSeconds(1) >= timeout)))
+                        throw new EtchvException(0, "Network error", requestId, options.IdempotencyKey, e);
+                    dropped = e;
                     await Task.Delay(1000, ct).ConfigureAwait(false);
                 }
             }
         }
         catch (OperationCanceledException) when (!caller.IsCancellationRequested)
-        { throw new EtchvException(0, "Client deadline exceeded; job may still complete", requestId, options.IdempotencyKey); }
+        {
+            // A download that ran out of time while retrying a dropped connection throws that network error.
+            if (!durable && options.IdempotencyKey is null && dropped is not null) throw new EtchvException(0, "Network error", requestId, null, dropped);
+            throw new EtchvException(0, resend && options.IdempotencyKey is null ? "Client deadline exceeded" : "Client deadline exceeded; job may still complete",
+                requestId, options.IdempotencyKey);
+        }
     }
 
     /// <summary>

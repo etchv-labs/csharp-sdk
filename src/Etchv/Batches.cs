@@ -373,6 +373,12 @@ public sealed partial class EtchvClient
     /// HTTP 202 and the SDK waits as long as its <c>Retry-After</c> asks (at least 1 second), up to <paramref name="timeout"/>. The download
     /// itself has no total deadline; it fails only if no data arrives for the client timeout.
     /// </summary>
+    /// <remarks>
+    /// The archive route does not resume a download. When the connection drops or stalls mid-download and
+    /// <paramref name="timeout"/> has not passed, a seekable <paramref name="destination"/> is cut back to the position it
+    /// had when the call began and the zip is streamed again. A stream that cannot seek (a network or pipe stream) has
+    /// already passed the bytes on, so the error is thrown instead.
+    /// </remarks>
     /// <param name="batchId">Batch ID (<c>bat_…</c>).</param>
     /// <param name="destination">Writable stream that receives the zip; it is not closed.</param>
     /// <param name="timeout">How long to wait for the archive to be ready (default 1 hour).</param>
@@ -386,7 +392,8 @@ public sealed partial class EtchvClient
     /// stalls ("The archive download stalled: no data for …"), or when a request's response headers do not arrive within
     /// the client timeout and <paramref name="timeout"/> has passed ("Client deadline exceeded waiting for the archive
     /// response"; earlier header timeouts are retried). Status 0 with the transport exception inside for a network
-    /// error that outlasts <paramref name="timeout"/> ("Network error"). Exceptions from <paramref name="destination"/>
+    /// error that outlasts <paramref name="timeout"/> ("Network error"), or that cuts off the download of a stream that
+    /// cannot seek ("Network error during the archive download"). Exceptions from <paramref name="destination"/>
     /// propagate unchanged.
     /// </exception>
     public async Task<long> DownloadBatchArchiveAsync(string batchId, Stream destination, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
@@ -397,6 +404,7 @@ public sealed partial class EtchvClient
         var wait = CheckWait(timeout);
         var clock = System.Diagnostics.Stopwatch.StartNew();
         var target = new Uri(baseUrl + "/" + path);
+        long? start = destination.CanSeek ? destination.Position : null;
         while (true)
         {
             TimeSpan delay;
@@ -429,7 +437,17 @@ public sealed partial class EtchvClient
                     int status = (int)response.StatusCode;
                     if (response.RequestMessage?.RequestUri is { } final && final != target)
                         throw new EtchvException(status, "Redirects are not followed; configure the HttpClient with AllowAutoRedirect = false", requestId);
-                    if (status == 200) return await CopyArchiveAsync(response, destination, requestId, cancellationToken).ConfigureAwait(false);
+                    if (status == 200)
+                    {
+                        try { return await CopyArchiveAsync(response, destination, requestId, cancellationToken).ConfigureAwait(false); }
+                        catch (EtchvException e) when (e.StatusCode == 0 && start is not null && clock.Elapsed < wait)
+                        {
+                            // The archive route does not serve Range requests: drop what was written and start over.
+                            if (!Rewind(destination, start.Value)) throw;
+                        }
+                        await Task.Delay(Min(TimeSpan.FromSeconds(1), wait - clock.Elapsed), cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
                     byte[] body;
                     using (var idle = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                     {
@@ -562,7 +580,19 @@ public sealed partial class EtchvClient
         return delay < MinBatchPoll ? MinBatchPoll : delay;
     }
 
-    private static TimeSpan Min(TimeSpan a, TimeSpan b) => a < b ? a : b;
+    /// <summary>The shorter wait, never negative (the deadline may already have passed).</summary>
+    private static TimeSpan Min(TimeSpan a, TimeSpan b)
+    {
+        var shorter = a < b ? a : b;
+        return shorter > TimeSpan.Zero ? shorter : TimeSpan.Zero;
+    }
+
+    /// <summary>Cuts <paramref name="destination"/> back to <paramref name="origin"/>; false when the stream cannot be truncated.</summary>
+    private static bool Rewind(Stream destination, long origin)
+    {
+        try { destination.SetLength(origin); destination.Position = origin; return true; }
+        catch (NotSupportedException) { return false; }
+    }
 
     /// <summary>One batch call under the client deadline; see <see cref="BatchSendAsync"/>.</summary>
     private async Task<Reply> BatchCallAsync(HttpMethod method, string path, Func<HttpContent>? content, string? idempotencyKey, bool retryUnavailable, CancellationToken caller)
